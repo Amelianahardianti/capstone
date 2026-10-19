@@ -21,6 +21,16 @@ const uint8_t ADC_PIN = 0;
 // Frekuensi sampling (Hz). 100–200 Hz untuk tahap awal.
 const uint32_t SAMPLE_RATE_HZ = 200;
 
+// Data plot dikirim setiap N sampel (200 Hz / 4 = 50 titik per detik) agar grafik
+// bergerak lebih lambat. Nilai raw yang dikirim adalah MAKSIMUM dari N sampel itu,
+// sehingga puncak ketukan yang singkat tidak hilang. Deteksi tetap memakai semua sampel.
+const uint8_t PLOT_EVERY_N = 4;
+
+// Envelope: tinggi sinyal yang turun perlahan setelah puncak. Ketukan yang hanya
+// 1–2 sampel tampil sebagai "bukit" lebar (±0,5 detik) di grafik.
+// Per sampel; makin dekat ke 1 = makin lambat turun.
+const float ENVELOPE_DECAY = 0.98f;
+
 // Jumlah sampel untuk moving average (mode SMOOTH). Lebih besar = lebih halus
 // tetapi puncak ketukan ikut "tumpul" dan sedikit terlambat.
 const uint8_t SMOOTH_WINDOW = 8;
@@ -79,6 +89,10 @@ int      lastTapPeak  = 0;   // puncak ketukan terakhir yang selesai
 int      maxPeak      = 0;   // puncak terbesar sejak reset
 uint32_t lastTapMs    = 0;
 
+float    envelope     = 0;   // di atas baseline, turun perlahan (lihat ENVELOPE_DECAY)
+int      plotRawMax   = 0;   // raw maksimum sejak titik plot terakhir
+uint8_t  plotCounter  = 0;
+
 const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE_HZ;
 uint32_t nextSampleUs = 0;
 
@@ -124,6 +138,7 @@ void printInfo() {
   Serial.println("=== INFO ===");
   Serial.printf(" ADC pin        : GPIO%u\n", ADC_PIN);
   Serial.printf(" Sampling       : %lu Hz\n", (unsigned long)SAMPLE_RATE_HZ);
+  Serial.printf(" Titik plot     : %lu per detik\n", (unsigned long)(SAMPLE_RATE_HZ / PLOT_EVERY_N));
   Serial.printf(" Mode           : %s\n", modeName());
   Serial.printf(" Data plot      : %s\n", plotOn ? "ON" : "OFF (tekan q)");
   Serial.printf(" Smooth window  : %u sampel\n", SMOOTH_WINDOW);
@@ -157,7 +172,9 @@ void calibrateBaseline() {
     smoothBuf[i] = (uint16_t)baseline;
     smoothSum += smoothBuf[i];
   }
-  inTap = false;
+  inTap      = false;
+  envelope   = 0;
+  plotRawMax = 0;
   setLed(false);
   if (textAllowed()) {
     Serial.printf("[KALIBRASI] Baseline = %.1f (dari %lu sampel)\n", baseline, (unsigned long)n);
@@ -191,17 +208,19 @@ void handleCommand(char c) {
 void plotSample(int raw, int smooth) {
   int base = (int)baseline;
   int thr  = base + threshold;
+  int env  = base + (int)envelope;   // satuan sama dengan threshold, bisa digabung 1 grafik
 
   if (plotFormat == FORMAT_TELEPLOT) {
     // Format Teleplot: satu variabel per baris, diawali '>'
     if (mode != MODE_SMOOTH) Serial.printf(">raw:%d\n", raw);
     if (mode != MODE_RAW)    Serial.printf(">smooth:%d\n", smooth);
-    Serial.printf(">baseline:%d\n>threshold:%d\n>taps:%lu\n", base, thr, (unsigned long)tapCount);
+    Serial.printf(">envelope:%d\n>baseline:%d\n>threshold:%d\n>taps:%lu\n",
+                  env, base, thr, (unsigned long)tapCount);
   } else {
     // Format Arduino Serial Plotter: "nama:nilai" dipisah koma, satu baris per sampel
     if (mode != MODE_SMOOTH) Serial.printf("raw:%d,", raw);
     if (mode != MODE_RAW)    Serial.printf("smooth:%d,", smooth);
-    Serial.printf("baseline:%d,threshold:%d\n", base, thr);
+    Serial.printf("envelope:%d,baseline:%d,threshold:%d\n", env, base, thr);
   }
 }
 
@@ -264,6 +283,9 @@ void loop() {
   int amplitude = signal - (int)baseline;   // tinggi sinyal di atas baseline
   uint32_t nowMs = millis();
 
+  // ---- Envelope: naik langsung ke puncak, turun perlahan ----
+  envelope = max((float)amplitude, envelope * ENVELOPE_DECAY);
+
   // ---- Deteksi ketukan (dengan hysteresis + jeda minimum) ----
   if (!inTap) {
     if (amplitude > threshold && nowMs - lastTapMs >= MIN_TAP_INTERVAL_MS) {
@@ -291,6 +313,11 @@ void loop() {
     }
   }
 
-  // ---- Kirim ke plotter ----
-  if (plotOn) plotSample(raw, smooth);
+  // ---- Kirim ke plotter (1 titik per PLOT_EVERY_N sampel) ----
+  if (raw > plotRawMax) plotRawMax = raw;
+  if (++plotCounter >= PLOT_EVERY_N) {
+    plotCounter = 0;
+    if (plotOn) plotSample(plotRawMax, smooth);
+    plotRawMax = 0;
+  }
 }

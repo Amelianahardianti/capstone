@@ -1,593 +1,329 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include <TM1637Display.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
 
-// ================= KONFIGURASI WIFI & MQTT =================
-// (TIDAK DIUBAH — kompatibilitas dengan Computer Vision dipertahankan)
-const char* ssid = "veroo";         // GANTI DENGAN WIFI HP/ROUTER
-const char* password = "veronica"; // GANTI DENGAN PASS WIFI
-const char* mqtt_server = "10.76.111.208";  // IP Laptop kamu (adapter Wi-Fi, satu jaringan dgn ESP32)
-
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-// ============================================================
-// KONFIGURASI PIN
-// ============================================================
-// --- Input / Sensor ---
-const int PIR_PIN         = 13;
-const int LDR_PIN         = 34;
-const int BUTTON_PIN      = 18;
-
-// --- Output: Lampu Kendaraan ---
-const int VEHICLE_RED_PIN    = 23;
-const int VEHICLE_YELLOW_PIN = 22;
-const int VEHICLE_GREEN_PIN  = 21;
-
-// --- Output: Lampu Penyeberang ---
-const int HUMAN_RED_PIN   = 19;
-const int HUMAN_GREEN_PIN = 32;
-
-// --- Output: PJU ---
-const int PJU_WHITE_PIN = 33;
-
-// --- Output: Buzzer (ACTIVE buzzer — hanya ON/OFF, tidak pakai tone()/PWM) ---
-const int BUZZER_PIN = 27;
-
-// --- Output: 7-Segment (modul DIO+CLK berbasis chip TM1637, lihat catatan di bawah) ---
-const int SEVENSEG_DIO_PIN = 4;
-const int SEVENSEG_CLK_PIN = 26;
-
-// ============================================================
-// KONSTANTA LOGIC
-// ============================================================
-const int LDR_THRESHOLD   = 400;   // Diwarisi dari kode lama, dipakai ulang untuk PJU. Kalibrasi ulang di lapangan jika perlu.
-const int LDR_SAMPLES     = 10;
-const unsigned long MOTION_TIMEOUT_MS = 15000UL;   // Timeout anti-stuck (dipertahankan dari kode lama)
-const unsigned long LDR_POLL_INTERVAL_MS = 1000UL; // Interval baca LDR untuk PJU — dipercepat dari 3000ms karena
-                                                     // PJU sekarang juga bergantung pada event PIR yang bisa
-                                                     // mulai/selesai kapan saja (butuh respons lebih cepat)
-
-// Debounce push button (mekanis, beda karakter dari PIR — bukan asumsi baru,
-// hanya nilai umum untuk tombol mekanis biasa; dokumentasikan agar mudah dikalibrasi)
-const unsigned long BUTTON_DEBOUNCE_MS = 250UL;
-
-// Tidak ada fase transisi kuning 3 detik maupun all-red clearance 1,5 detik —
-// begitu PIR/Button trigger, langsung Vehicle RED + Human GREEN (lihat vTaskControl).
-const unsigned long VEHICLE_GREEN_HOLD_MS          = 5000UL; // Vehicle GREEN tetap tepat 5 detik pasca-crossing
-const unsigned long VEHICLE_YELLOW_BLINK_PERIOD_MS = 1000UL; // Fase C (idle): kedip kuning, 500ms ON / 500ms OFF
-const unsigned long IDLE_POLL_INTERVAL_MS          = 100UL;  // resolusi polling saat idle (blink + respons cepat ke event baru)
-
-// ============================================================
-// STATE SISTEM (menggantikan flag boolean tunggal `adaOrang`)
-// ============================================================
-enum SystemState {
-  SYS_STANDBY,            // IDLE: Vehicle YELLOW berkedip, Human RED, menunggu event berikutnya
-  SYS_PEDESTRIAN_REQUEST, // Flag "busy" instan saat baru di-trigger (PIR/Button), sebelum Task_Control bangun
-  SYS_CHECK_CV,           // Vehicle RED + Human GREEN sudah aktif; menunggu/evaluasi HOLD/timer dari CV
-  SYS_HOLD,               // CV bilang jalan tidak aman, tunggu sampai aman/timeout (lampu tetap seperti CHECK_CV)
-  SYS_CROSSING,           // Menyeberang aktif: countdown + buzzer berjalan
-  SYS_VEHICLE_GREEN_5S    // Kendaraan hijau tetap selama 5 detik pasca-crossing
-};
-
-enum VehicleLightState { VEHICLE_RED, VEHICLE_YELLOW, VEHICLE_GREEN };
-enum HumanLightState   { HUMAN_RED, HUMAN_GREEN };
-
-// ============================================================
-// HANDLE TASK & SINKRONISASI
-// ============================================================
-TaskHandle_t xTaskPIRHandle     = NULL;
-TaskHandle_t xTaskButtonHandle  = NULL;
-TaskHandle_t xTaskMQTTHandle    = NULL;
-TaskHandle_t xTaskControlHandle = NULL; // dulu xTaskLEDHandle — sekarang state-machine terpusat
-TaskHandle_t xTaskEnvHandle     = NULL; // task baru: LDR -> PJU, independen dari crossing
-
-// Mutex untuk state sistem + timestamp gerakan terakhir
-// (menggantikan xMutexAdaOrang — pola mutex+variable biasa dipertahankan persis)
-SemaphoreHandle_t xMutexState = NULL;
-SystemState   currentState   = SYS_STANDBY; // Diakses HANYA lewat mutex
-unsigned long lastMotionTime = 0;           // Diakses HANYA lewat mutex
-
-// Mutex untuk data dari CV + flag publish (TIDAK DIUBAH dari kode lama)
-SemaphoreHandle_t xMutexTimer = NULL;
-int  timerDariCV = 10;               // default fallback 10 detik
-bool statusHold  = false;            // true jika CV kirim "HOLD"
-bool pendingPublishTrigger = false;  // flag publish, dieksekusi di Core 0 oleh vTaskMQTT
-
-TM1637Display sevenSeg(SEVENSEG_CLK_PIN, SEVENSEG_DIO_PIN);
-
-// ============================================================
-// HELPER: Akses currentState & lastMotionTime dengan aman (thread-safe)
-// ============================================================
-SystemState getSystemState() {
-  SystemState nilai;
-  if (xSemaphoreTake(xMutexState, pdMS_TO_TICKS(10)) == pdTRUE) {
-    nilai = currentState;
-    xSemaphoreGive(xMutexState);
-  } else {
-    nilai = SYS_STANDBY; // Safe default jika mutex timeout
-  }
-  return nilai;
-}
-
-void setSystemState(SystemState nilai) {
-  if (xSemaphoreTake(xMutexState, pdMS_TO_TICKS(10)) == pdTRUE) {
-    currentState = nilai;
-    xSemaphoreGive(xMutexState);
-  }
-}
-
-void refreshLastMotionTime() {
-  if (xSemaphoreTake(xMutexState, pdMS_TO_TICKS(10)) == pdTRUE) {
-    lastMotionTime = millis();
-    xSemaphoreGive(xMutexState);
-  }
-}
-
-unsigned long getLastMotionTime() {
-  unsigned long t;
-  if (xSemaphoreTake(xMutexState, pdMS_TO_TICKS(10)) == pdTRUE) {
-    t = lastMotionTime;
-    xSemaphoreGive(xMutexState);
-  } else {
-    t = millis(); // Safe: anggap baru saja ada gerakan
-  }
-  return t;
-}
-
-// ============================================================
-// HELPER: Median filter untuk ADC LDR (anti-noise) — TIDAK DIUBAH dari kode lama
-// ============================================================
-int bacaLDRFiltered() {
-  int samples[LDR_SAMPLES];
-
-  for (int i = 0; i < LDR_SAMPLES; i++) {
-    samples[i] = analogRead(LDR_PIN);
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-
-  for (int i = 0; i < LDR_SAMPLES - 1; i++) {
-    for (int j = 0; j < LDR_SAMPLES - i - 1; j++) {
-      if (samples[j] > samples[j + 1]) {
-        int tmp = samples[j];
-        samples[j] = samples[j + 1];
-        samples[j + 1] = tmp;
-      }
-    }
-  }
-
-  return samples[LDR_SAMPLES / 2];
-}
-
-// ============================================================
-// OUTPUT TERPUSAT — SATU-SATUNYA fungsi yang boleh menulis GPIO
-// lampu kendaraan/manusia, supaya kombinasi tidak pernah invalid.
-// Hanya dipanggil dari vTaskControl.
-// ============================================================
-void applyTrafficState(VehicleLightState v, HumanLightState h) {
-  // Guard keselamatan: kombinasi berbahaya dipaksa ke kondisi aman (semua berhenti)
-  if (v == VEHICLE_GREEN && h == HUMAN_GREEN) {
-    Serial.println("SAFETY:BLOCKED_INVALID_COMBO_FORCE_ALL_RED");
-    v = VEHICLE_RED;
-    h = HUMAN_RED;
-  }
-
-  digitalWrite(VEHICLE_RED_PIN,    v == VEHICLE_RED    ? HIGH : LOW);
-  digitalWrite(VEHICLE_YELLOW_PIN, v == VEHICLE_YELLOW ? HIGH : LOW);
-  digitalWrite(VEHICLE_GREEN_PIN,  v == VEHICLE_GREEN  ? HIGH : LOW);
-  digitalWrite(HUMAN_RED_PIN,      h == HUMAN_RED   ? HIGH : LOW);
-  digitalWrite(HUMAN_GREEN_PIN,    h == HUMAN_GREEN ? HIGH : LOW);
-
-  static VehicleLightState lastLoggedV = VEHICLE_RED;
-  static HumanLightState   lastLoggedH = HUMAN_RED;
-  static bool firstCall = true;
-
-  if (firstCall || v != lastLoggedV) {
-    Serial.print("VEHICLE:");
-    Serial.println(v == VEHICLE_RED ? "RED" : v == VEHICLE_YELLOW ? "YELLOW" : "GREEN");
-    lastLoggedV = v;
-  }
-  if (firstCall || h != lastLoggedH) {
-    Serial.print("HUMAN:");
-    Serial.println(h == HUMAN_RED ? "RED" : "GREEN");
-    lastLoggedH = h;
-  }
-  firstCall = false;
-}
-
-void setBuzzer(bool on) {
-  static bool lastOn = false;
-  static bool firstCall = true;
-  digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
-  if (firstCall || on != lastOn) {
-    Serial.print("BUZZER:");
-    Serial.println(on ? "ON" : "OFF");
-    lastOn = on;
-    firstCall = false;
-  }
-}
-
-// ============================================================
-// IDLE / VEHICLE_YELLOW_BLINK — Fase C (state SYS_STANDBY)
-// Vehicle: hanya YELLOW yang berkedip non-blocking (berbasis millis()),
-// RED & GREEN kendaraan mati. Human tetap RED selama idle (aman).
-// ============================================================
-void enterIdleBlink() {
-  digitalWrite(VEHICLE_RED_PIN, LOW);
-  digitalWrite(VEHICLE_GREEN_PIN, LOW);
-  digitalWrite(HUMAN_RED_PIN, HIGH);
-  digitalWrite(HUMAN_GREEN_PIN, LOW);
-  Serial.println("VEHICLE:YELLOW_BLINK_IDLE");
-  Serial.println("HUMAN:RED");
-}
-
-void tickVehicleYellowBlink() {
-  bool on = (millis() % VEHICLE_YELLOW_BLINK_PERIOD_MS) < (VEHICLE_YELLOW_BLINK_PERIOD_MS / 2);
-  digitalWrite(VEHICLE_YELLOW_PIN, on ? HIGH : LOW);
-}
-
-void update7Segment(int value) {
-  sevenSeg.showNumberDec(value, false);
-}
-
-// ============================================================
-// ISR — PIR & PUSH BUTTON (seminimal mungkin, hanya di IRAM)
-// ============================================================
-void IRAM_ATTR pirInterruptHandler() {
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  vTaskNotifyGiveFromISR(xTaskPIRHandle, &xHigherPriorityTaskWoken);
-  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-void IRAM_ATTR buttonInterruptHandler() {
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  vTaskNotifyGiveFromISR(xTaskButtonHandle, &xHigherPriorityTaskWoken);
-  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-// ============================================================
-// Titik masuk permintaan menyeberang — dipakai bersama oleh
-// vTaskPIR dan vTaskButton supaya kedua sumber trigger konsisten
-// (satu event software yang sama: "ada yang mau menyeberang").
-// ============================================================
-void requestPedestrianCrossing(const char* source) {
-  refreshLastMotionTime(); // selalu refresh, dipakai juga untuk timeout HOLD
-
-  if (getSystemState() == SYS_STANDBY) {
-    setSystemState(SYS_PEDESTRIAN_REQUEST);
-
-    if (xSemaphoreTake(xMutexTimer, pdMS_TO_TICKS(10)) == pdTRUE) {
-      pendingPublishTrigger = true; // dieksekusi vTaskMQTT (hindari race condition PubSubClient antar-core)
-      xSemaphoreGive(xMutexTimer);
-    }
-
-    Serial.print("STATUS:PEDESTRIAN_REQUEST:");
-    Serial.println(source);
-
-    xTaskNotifyGive(xTaskControlHandle);
-  } else {
-    // Sequence sedang berjalan — jangan restart, cukup refresh timestamp (sudah dilakukan di atas)
-    Serial.print("STATUS:REQUEST_IGNORED_BUSY:");
-    Serial.println(source);
-  }
-}
-
-// ============================================================
-// TASK: PIR Handler — Core 1, Priority 3 (pola debounce TIDAK DIUBAH)
-// ============================================================
-void vTaskPIR(void *pvParameters) {
-  TickType_t lastTriggerTick = 0;
-  const TickType_t debounceTicks = pdMS_TO_TICKS(500);
-
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    TickType_t sekarang = xTaskGetTickCount();
-    if ((sekarang - lastTriggerTick) < debounceTicks) {
-      continue;
-    }
-    lastTriggerTick = sekarang;
-
-    if (digitalRead(PIR_PIN) == HIGH) {
-      Serial.println("PIR:TRIGGERED");
-      requestPedestrianCrossing("PIR");
-    }
-  }
-}
-
-// ============================================================
-// TASK: Push Button Handler — Core 1, Priority 3
-// Fungsi: trigger manual untuk pengujian, meniru event PIR tanpa
-// harus menunggu sensor gerak fisik terpicu.
-// ============================================================
-void vTaskButton(void *pvParameters) {
-  TickType_t lastTriggerTick = 0;
-  const TickType_t debounceTicks = pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS);
-
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    TickType_t sekarang = xTaskGetTickCount();
-    if ((sekarang - lastTriggerTick) < debounceTicks) {
-      continue;
-    }
-    lastTriggerTick = sekarang;
-
-    // INPUT_PULLUP: tombol ditekan = LOW
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      Serial.println("BUTTON:PRESSED");
-      requestPedestrianCrossing("BUTTON");
-    }
-  }
-}
-
-// ============================================================
-// TASK: MQTT — Core 0, Priority 2 (TIDAK DIUBAH dari kode lama)
-// ============================================================
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  Serial.print("Data dari CV: ");
-  Serial.println(message);
-
-  StaticJsonDocument<128> doc;
-  DeserializationError err = deserializeJson(doc, message);
-  if (!err) {
-    if (xSemaphoreTake(xMutexTimer, pdMS_TO_TICKS(10)) == pdTRUE) {
-      if (doc["timer"].is<const char*>() && String(doc["timer"].as<const char*>()) == "HOLD") {
-        statusHold = true;
-      } else {
-        statusHold = false;
-        timerDariCV = doc["timer"] | 10;
-      }
-      xSemaphoreGive(xMutexTimer);
-    }
-  }
-}
-
-void vTaskMQTT(void *pvParameters) {
-  for (;;) {
-    if (!client.connected()) {
-      Serial.print("Koneksi MQTT...");
-
-      if (client.connect("ESP32_Master")) {
-        Serial.println("Terhubung!");
-        client.subscribe("jalan/status");
-      } else {
-        Serial.print("MQTT GAGAL, state = ");
-        Serial.println(client.state());
-        vTaskDelay(pdMS_TO_TICKS(3000));
-      }
-
-    } else {
-      client.loop();
-
-      if (xSemaphoreTake(xMutexTimer, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (pendingPublishTrigger) {
-          client.publish("jalan/trigger", "ADA_ORANG");
-          pendingPublishTrigger = false;
-        }
-        xSemaphoreGive(xMutexTimer);
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
-
-// ============================================================
-// TASK: Environment (LDR + Event PIR -> PJU) — Core 0, Priority 1
-// PJU WHITE menyala HANYA jika: gelap (LDR) DAN ada pedestrian
-// event aktif (currentState != SYS_STANDBY). Task ini tetap terpisah
-// dari vTaskControl — hanya MEMBACA state lewat getSystemState(),
-// tidak pernah menulis GPIO lampu kendaraan/manusia, dan sebaliknya
-// vTaskControl tidak pernah menyentuh PJU_WHITE_PIN.
-// ============================================================
-void vTaskEnv(void *pvParameters) {
-  bool pjuOn = false;
-  bool firstRun = true;
-
-  for (;;) {
-    int nilaiLDR = bacaLDRFiltered();
-    bool gelap = (nilaiLDR < LDR_THRESHOLD);          // GELAP jika di bawah threshold
-    bool eventAktif = (getSystemState() != SYS_STANDBY); // ada pedestrian event sedang berjalan
-    bool shouldBeOn = gelap && eventAktif;
-
-    if (firstRun || shouldBeOn != pjuOn) {
-      pjuOn = shouldBeOn;
-      digitalWrite(PJU_WHITE_PIN, pjuOn ? HIGH : LOW);
-      Serial.print("LDR_VALUE:");
-      Serial.println(nilaiLDR);
-      Serial.print("PJU:");
-      Serial.println(pjuOn ? "ON" : "OFF");
-      firstRun = false;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(LDR_POLL_INTERVAL_MS));
-  }
-}
-
-// ============================================================
-// TASK: Control — Core 0, Priority 1
-// State-machine terpusat: traffic light, pedestrian light,
-// countdown, buzzer, 7-segment. Menggantikan vTaskLED lama.
-// ============================================================
-void vTaskControl(void *pvParameters) {
-  for (;;) {
-    // ---------- SYS_STANDBY (IDLE): Vehicle YELLOW berkedip, tunggu event ----------
-    setSystemState(SYS_STANDBY);
-    enterIdleBlink();
-
-    uint32_t notified;
-    do {
-      notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(IDLE_POLL_INTERVAL_MS));
-      if (notified == 0) {
-        tickVehicleYellowBlink(); // masih idle, lanjut berkedip
-      }
-    } while (notified == 0);
-
-    // ---------- SYS_CHECK_CV ----------
-    // Begitu PIR/Button trigger, LANGSUNG Vehicle RED + Human GREEN (tanpa fase
-    // kuning/transisi) — kendaraan berhenti & manusia dapat sinyal jalan duluan,
-    // sambil menunggu CV memberi tahu aman/HOLD dan berapa lama timer-nya.
-    setSystemState(SYS_CHECK_CV);
-    applyTrafficState(VEHICLE_RED, HUMAN_GREEN);
-    vTaskDelay(pdMS_TO_TICKS(200)); // beri waktu MQTT update timerDariCV terbaru (dipertahankan dari kode lama)
-
-    bool sequenceAborted = false;
-
-    for (;;) {
-      bool hold = false;
-
-      if (xSemaphoreTake(xMutexTimer, pdMS_TO_TICKS(10)) == pdTRUE) {
-        hold = statusHold;
-        xSemaphoreGive(xMutexTimer);
-      }
-
-      if (!hold) break; // aman & timer tersedia -> lanjut ke crossing
-
-      // ---------- SYS_HOLD ----------
-      setSystemState(SYS_HOLD);
-      setBuzzer(false); // requirement: selama HOLD, buzzer harus OFF (bukan berdenyut)
-      Serial.println("STATUS:HOLD_WAITING");
-
-      vTaskDelay(pdMS_TO_TICKS(1000)); // cek ulang tiap 1 detik
-
-      if ((millis() - getLastMotionTime()) > MOTION_TIMEOUT_MS) {
-        Serial.println("SYSTEM:TIMEOUT_STANDBY");
-        sequenceAborted = true;
-        break;
-      }
-    }
-
-    if (sequenceAborted) {
-      setBuzzer(false);
-      continue; // balik ke atas -> SYS_STANDBY (idle blink) lagi
-    }
-
-    // ---------- SYS_CROSSING ----------
-    // Lampu sudah Vehicle RED + Human GREEN dari fase CHECK_CV, tidak perlu diubah lagi.
-    setSystemState(SYS_CROSSING);
-    int countdown = 10;
-    if (xSemaphoreTake(xMutexTimer, pdMS_TO_TICKS(10)) == pdTRUE) {
-      countdown = timerDariCV;
-      xSemaphoreGive(xMutexTimer);
-    }
-
-    update7Segment(countdown);
-    setBuzzer(true); // buzzer ON selama countdown > 0 (tidak ada timer buzzer terpisah)
-    Serial.println("STATUS:CROSSING_START");
-    Serial.print("COUNTDOWN:");
-    Serial.println(countdown);
-
-    unsigned long lastSecondTick = millis();
-    while (countdown > 0) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-
-      if (millis() - lastSecondTick >= 1000UL) {
-        lastSecondTick += 1000UL;
-        countdown--;
-        update7Segment(countdown);
-        Serial.print("COUNTDOWN:");
-        Serial.println(countdown);
-      }
-    }
-    setBuzzer(false); // countdown == 0 -> buzzer OFF
-
-    // ---------- COUNTDOWN SELESAI: langsung Vehicle GREEN + Human RED, tanpa all-red gap ----------
-    sevenSeg.clear();
-    applyTrafficState(VEHICLE_GREEN, HUMAN_RED);
-
-    // ---------- SYS_VEHICLE_GREEN_5S ----------
-    setSystemState(SYS_VEHICLE_GREEN_5S);
-    Serial.println("SYSTEM:VEHICLE_GREEN_5S_START");
-    vTaskDelay(pdMS_TO_TICKS(VEHICLE_GREEN_HOLD_MS)); // non-blocking (vTaskDelay), task lain tetap jalan
-
-    Serial.println("SYSTEM:CYCLE_DONE_RETURN_TO_IDLE");
-    // balik ke atas for(;;) -> SYS_STANDBY (Vehicle YELLOW blink idle)
-  }
-}
-
-// ============================================================
-// SETUP
-// ============================================================
+// ===============================================================
+// Smart Safe Walking Path — Traffic Light + PJU + Buzzer + 7-Segment
+//
+// Siklus sistem:
+//   1. IDLE  : hanya Kuning kedip. Merah & Hijau mati, PJU mati, layar mati.
+//              Menunggu push button.
+//   2. TIMER : (setelah push button) Merah nyala, PILOT nyala,
+//              7-segment hitung mundur 15 -> 0, buzzer bunyi.
+//              LDR dibaca SAAT tombol ditekan: gelap -> PJU nyala,
+//              terang -> PJU mati.
+//   3. HIJAU : (setelah countdown habis) Hijau nyala 7 detik, Kuning mati.
+//   -> kembali ke IDLE (PJU dimatikan, kuning kedip lagi).
+//
+// Semua proses berbasis millis() (tanpa delay).
+// ===============================================================
+
+void tampilkanAngka(int angka);
+void matikanSevenSegment();
+void resetSevenSegment();
+void resetVariabel();
+bool tombolDitekan();
+void mulaiSiklus(unsigned long sekarang);
+void updateLampu(unsigned long sekarang);
+void updateBuzzer(unsigned long sekarang);
+void setBuzzer(bool bunyi);
+void tesRelay();
+
+// ================= DEFINISI PIN ================= //
+// Pin Input
+const int PIN_BUTTON = 32;
+const int PIN_LDR = 34; // Dihubungkan ke pin DO pada modul LDR
+
+// Pin Output Lampu (modul relay)
+const int PIN_PJU = 2;
+const int LAMPU_KUNING = 26; // Kedip saat idle
+const int LAMPU_MERAH = 27;  // Menyala saat timer jalan
+const int LAMPU_HIJAU = 15;  // Menyala 7 detik setelah timer habis
+
+const int PIN_PILOT  = 4;    // HIGH selama timer jalan (sama seperti kode tes)
+const int PIN_BUZZER = 13;   // Buzzer 5V: OUTPUT+LOW = bunyi, INPUT = mati
+
+// Pin Dekoder 1 (Puluhan)
+const int DEC1_A = 19;
+const int DEC1_B = 16;
+const int DEC1_C = 17;
+const int DEC1_D = 18;
+
+// Pin Dekoder 2 (Satuan)
+const int DEC2_A = 25;
+const int DEC2_B = 21;
+const int DEC2_C = 22;
+const int DEC2_D = 33;
+
+// ================= PENGATURAN ================= //
+// Modul relay ACTIVE-HIGH: HIGH = ON, LOW = OFF.
+// Jika ternyata relay menyala saat LOW, cukup tukar dua nilai ini.
+const int RELAY_ON  = HIGH;
+const int RELAY_OFF = LOW;
+
+const int DURASI_TIMER = 15;                    // Hitung mundur 15 -> 0 (detik)
+const unsigned long DURASI_HIJAU_MS = 7000;     // Hijau nyala 7 detik setelah countdown
+const unsigned long KEDIP_KUNING_MS = 500;      // Kuning ON 0,5 s / OFF 0,5 s
+const unsigned long DEBOUNCE_MS = 50;           // Debounce tombol
+
+// Level pin DO modul LDR saat kondisi GELAP.
+// Modul LDR umumnya: gelap = HIGH, terang = LOW.
+// Jika PJU malah nyala saat terang, ganti menjadi LOW.
+const int LDR_GELAP = HIGH;
+
+// true = saat ESP32 menyala, tiap relay dinyalakan 1 detik bergantian
+// (MERAH -> KUNING -> HIJAU -> PJU) untuk mengecek wiring relay.
+const bool TES_RELAY_SAAT_BOOT = true;
+
+// ================= VARIABEL SISTEM ================= //
+enum FaseSistem { FASE_IDLE, FASE_TIMER, FASE_HIJAU };
+FaseSistem fase = FASE_IDLE;
+
+int sisaWaktu = 0;
+unsigned long waktuDetikTerakhir = 0;
+unsigned long waktuMulaiHijau = 0;
+
+// Variabel untuk kedip kuning tanpa delay
+unsigned long waktuKedipTerakhir = 0;
+bool statusLampuKuning = false;
+
+// ================= SETUP ================= //
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { delay(10); }
 
-  // --- Input ---
-  pinMode(PIR_PIN, INPUT_PULLDOWN);
-  pinMode(LDR_PIN, INPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Pin 32 memiliki pull-up internal bawaan pabrik
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_LDR, INPUT); // Mode digital untuk DO
 
-  // --- Output ---
-  pinMode(VEHICLE_RED_PIN, OUTPUT);
-  pinMode(VEHICLE_YELLOW_PIN, OUTPUT);
-  pinMode(VEHICLE_GREEN_PIN, OUTPUT);
-  pinMode(HUMAN_RED_PIN, OUTPUT);
-  pinMode(HUMAN_GREEN_PIN, OUTPUT);
-  pinMode(PJU_WHITE_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(PJU_WHITE_PIN, LOW);
+  pinMode(PIN_PJU, OUTPUT);
+  pinMode(LAMPU_MERAH, OUTPUT);
+  pinMode(LAMPU_KUNING, OUTPUT);
+  pinMode(LAMPU_HIJAU, OUTPUT);
+  pinMode(PIN_PILOT, OUTPUT);
 
-  // Kondisi awal aman sementara (semua kendaraan berhenti) sebelum vTaskControl
-  // mengambil alih dan langsung masuk ke idle-blink (SYS_STANDBY).
-  applyTrafficState(VEHICLE_RED, HUMAN_RED);
+  // TRIK BUZZER: Jadikan INPUT agar jalur terputus dan buzzer 5V benar-benar mati
+  pinMode(PIN_BUZZER, INPUT);
 
-  // --- 7-Segment ---
-  sevenSeg.setBrightness(0x0f);
-  sevenSeg.clear();
+  // Tulis 0 ke register output dekoder SEBELUM pin dijadikan OUTPUT,
+  // agar saat pin aktif levelnya pasti LOW (bukan acak)
+  tampilkanAngka(0);
 
-  // --- WiFi & MQTT (TIDAK DIUBAH) ---
-  WiFi.begin(ssid, password);
-  Serial.print("Konek WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi OK!");
+  // Set semua pin dekoder sebagai OUTPUT
+  pinMode(DEC1_A, OUTPUT); pinMode(DEC1_B, OUTPUT);
+  pinMode(DEC1_C, OUTPUT); pinMode(DEC1_D, OUTPUT);
 
-  Serial.print("ESP32 IP: ");
-  Serial.println(WiFi.localIP());
+  pinMode(DEC2_A, OUTPUT); pinMode(DEC2_B, OUTPUT);
+  pinMode(DEC2_C, OUTPUT); pinMode(DEC2_D, OUTPUT);
 
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(mqttCallback);
+  // Kondisi awal: semua relay OFF, pilot OFF, variabel & 7-segment di-reset
+  digitalWrite(PIN_PJU, RELAY_OFF);
+  digitalWrite(LAMPU_MERAH, RELAY_OFF);
+  digitalWrite(LAMPU_KUNING, RELAY_OFF);
+  digitalWrite(LAMPU_HIJAU, RELAY_OFF);
+  digitalWrite(PIN_PILOT, LOW);
+  resetVariabel();
+  resetSevenSegment();
 
-  // --- Mutex (dibuat sebelum task) ---
-  xMutexState = xSemaphoreCreateMutex();
-  xMutexTimer = xSemaphoreCreateMutex();
+  Serial.println("\n=== ESP32 START ===");
+  if (TES_RELAY_SAAT_BOOT) tesRelay();
 
-  if (xMutexState == NULL || xMutexTimer == NULL) {
-    Serial.println("FATAL:MUTEX_CREATION_FAILED");
-    while (1);
-  }
-
-  // --- Tasks ---
-  xTaskCreatePinnedToCore(vTaskPIR, "Task_PIR", 2048, NULL, 3, &xTaskPIRHandle, 1);
-  xTaskCreatePinnedToCore(vTaskButton, "Task_Button", 2048, NULL, 3, &xTaskButtonHandle, 1);
-  xTaskCreatePinnedToCore(vTaskMQTT, "Task_MQTT", 4096, NULL, 2, &xTaskMQTTHandle, 0);
-  xTaskCreatePinnedToCore(vTaskControl, "Task_Control", 4096, NULL, 1, &xTaskControlHandle, 0);
-  xTaskCreatePinnedToCore(vTaskEnv, "Task_Env", 2048, NULL, 1, &xTaskEnvHandle, 0);
-
-  // Warm-up PIR: modul (mis. HC-SR501) butuh ~30-60 detik untuk stabil setelah power-on
-  Serial.println("SYSTEM:PIR_WARMUP_START");
-  delay(30000);
-  Serial.println("SYSTEM:PIR_WARMUP_DONE");
-
-  attachInterrupt(digitalPinToInterrupt(PIR_PIN), pirInterruptHandler, RISING);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonInterruptHandler, FALLING);
-
-  Serial.println("SYSTEM:READY_DUAL_CORE_RTOS");
+  Serial.println("=== SISTEM SIAP: IDLE (KUNING KEDIP) ===");
 }
 
+// ================= LOOP UTAMA ================= //
 void loop() {
-  vTaskDelete(NULL);
+  unsigned long sekarang = millis();
+  bool ditekan = tombolDitekan(); // dibaca tiap loop agar debounce tetap akurat
+
+  switch (fase) {
+    // --- IDLE: tunggu push button ---
+    case FASE_IDLE:
+      if (ditekan) mulaiSiklus(sekarang);
+      break;
+
+    // --- TIMER: hitung mundur tiap 1 detik ---
+    case FASE_TIMER:
+      if (sekarang - waktuDetikTerakhir >= 1000) {
+        waktuDetikTerakhir += 1000;
+        sisaWaktu--;
+
+        if (sisaWaktu >= 0) {
+          tampilkanAngka(sisaWaktu);
+          Serial.printf("COUNTDOWN: %d\n", sisaWaktu);
+        } else {
+          // Angka 0 sudah tampil 1 detik -> masuk fase hijau
+          fase = FASE_HIJAU;
+          waktuMulaiHijau = sekarang;
+          digitalWrite(PIN_PILOT, LOW);
+          resetSevenSegment();
+          Serial.println("TIMER SELESAI -> HIJAU 7 DETIK");
+        }
+      }
+      break;
+
+    // --- HIJAU: nyala 7 detik, lalu kembali idle ---
+    case FASE_HIJAU:
+      if (sekarang - waktuMulaiHijau >= DURASI_HIJAU_MS) {
+        digitalWrite(PIN_PJU, RELAY_OFF); // PJU mati, siap untuk penyeberang berikutnya
+        resetVariabel();                  // fase = IDLE, kedip kuning mulai dari awal
+        resetSevenSegment();
+        Serial.println("HIJAU SELESAI -> PJU OFF -> IDLE (KUNING KEDIP)");
+      }
+      break;
+  }
+
+  updateBuzzer(sekarang);
+  updateLampu(sekarang);
+}
+
+// ================= FUNGSI BANTUAN ================= //
+
+// Dipanggil saat push button ditekan di fase IDLE
+void mulaiSiklus(unsigned long sekarang) {
+  // LDR hanya dibaca saat tombol ditekan
+  bool gelap = (digitalRead(PIN_LDR) == LDR_GELAP);
+  digitalWrite(PIN_PJU, gelap ? RELAY_ON : RELAY_OFF);
+
+  // Mulai dari kondisi yang sama setiap siklus
+  resetVariabel();
+  resetSevenSegment();
+
+  fase = FASE_TIMER;
+  sisaWaktu = DURASI_TIMER;
+  waktuDetikTerakhir = sekarang;
+  digitalWrite(PIN_PILOT, HIGH);
+  tampilkanAngka(sisaWaktu);
+
+  Serial.println("\nTOMBOL DITEKAN -> TIMER MULAI -> MERAH");
+  Serial.printf("LDR DO: %s -> %s -> PJU: %s\n",
+                digitalRead(PIN_LDR) == HIGH ? "HIGH" : "LOW",
+                gelap ? "GELAP" : "TERANG",
+                gelap ? "ON" : "OFF");
+  Serial.printf("COUNTDOWN: %d\n", sisaWaktu);
+}
+
+// Lampu traffic light sesuai fase:
+// IDLE  = kuning kedip | TIMER = merah | HIJAU = hijau
+void updateLampu(unsigned long sekarang) {
+  if (fase == FASE_IDLE) {
+    if (sekarang - waktuKedipTerakhir >= KEDIP_KUNING_MS) {
+      statusLampuKuning = !statusLampuKuning;
+      waktuKedipTerakhir = sekarang;
+    }
+  } else {
+    statusLampuKuning = false;
+  }
+
+  digitalWrite(LAMPU_MERAH,  fase == FASE_TIMER ? RELAY_ON : RELAY_OFF);
+  digitalWrite(LAMPU_HIJAU,  fase == FASE_HIJAU ? RELAY_ON : RELAY_OFF);
+  digitalWrite(LAMPU_KUNING, statusLampuKuning  ? RELAY_ON : RELAY_OFF);
+}
+
+// Pola buzzer sama seperti kode tes (hanya saat timer jalan):
+// sisa 15-4: bunyi 500 ms, diam 500 ms (1 beep per detik)
+// sisa 3-0 : 4 beep cepat per detik (bunyi 125 ms, diam 125 ms)
+void updateBuzzer(unsigned long sekarang) {
+  bool bunyi = false;
+  if (fase == FASE_TIMER) {
+    unsigned long posisi = sekarang - waktuDetikTerakhir; // 0-999 ms di detik ini
+    if (sisaWaktu >= 4) {
+      bunyi = (posisi < 500);
+    } else {
+      bunyi = (posisi % 250) < 125;
+    }
+  }
+  setBuzzer(bunyi);
+}
+
+// Pinmode hanya diubah saat status berubah
+void setBuzzer(bool bunyi) {
+  static bool statusTerakhir = false;
+  if (bunyi == statusTerakhir) return;
+  statusTerakhir = bunyi;
+
+  if (bunyi) {
+    // Bunyi: Jadikan Output lalu tarik ke LOW
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
+  } else {
+    // Mati: Lepas jalur dengan menjadikannya INPUT
+    pinMode(PIN_BUZZER, INPUT);
+  }
+}
+
+// true satu kali setiap tombol ditekan (tepi turun, sudah di-debounce).
+// Menahan tombol tidak akan memulai siklus berulang-ulang.
+bool tombolDitekan() {
+  static int bacaanTerakhir = HIGH;
+  static int statusStabil = HIGH;
+  static unsigned long waktuBerubah = 0;
+
+  int bacaan = digitalRead(PIN_BUTTON);
+  if (bacaan != bacaanTerakhir) {
+    bacaanTerakhir = bacaan;
+    waktuBerubah = millis();
+  }
+
+  if (millis() - waktuBerubah >= DEBOUNCE_MS && bacaan != statusStabil) {
+    statusStabil = bacaan;
+    if (statusStabil == LOW) return true; // INPUT_PULLUP: ditekan = LOW
+  }
+  return false;
+}
+
+// Nyalakan tiap relay 1 detik bergantian, lihat Serial Monitor
+void tesRelay() {
+  const int pinRelay[]    = { LAMPU_MERAH, LAMPU_KUNING, LAMPU_HIJAU, PIN_PJU };
+  const char* namaRelay[] = { "MERAH",     "KUNING",     "HIJAU",     "PJU"   };
+
+  Serial.println("=== TES RELAY (tiap relay ON 1 detik) ===");
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("TES RELAY: %-6s (GPIO%d) ON\n", namaRelay[i], pinRelay[i]);
+    digitalWrite(pinRelay[i], RELAY_ON);
+    delay(1000);
+    digitalWrite(pinRelay[i], RELAY_OFF);
+    delay(300);
+  }
+  Serial.println("=== TES RELAY SELESAI ===");
+}
+
+void tampilkanAngka(int angka) {
+  int puluhan = angka / 10;
+  int satuan  = angka % 10;
+
+  digitalWrite(DEC1_A, bitRead(puluhan, 0));
+  digitalWrite(DEC1_B, bitRead(puluhan, 1));
+  digitalWrite(DEC1_C, bitRead(puluhan, 2));
+  digitalWrite(DEC1_D, bitRead(puluhan, 3));
+
+  digitalWrite(DEC2_A, bitRead(satuan, 0));
+  digitalWrite(DEC2_B, bitRead(satuan, 1));
+  digitalWrite(DEC2_C, bitRead(satuan, 2));
+  digitalWrite(DEC2_D, bitRead(satuan, 3));
+}
+
+// Fungsi Trik Biner untuk mematikan 7-Segment
+void matikanSevenSegment() {
+  // Kirim sinyal biner 1111 (Angka 15) agar IC 74LS47 melakukan "BLANK"
+  digitalWrite(DEC1_A, HIGH); digitalWrite(DEC1_B, HIGH);
+  digitalWrite(DEC1_C, HIGH); digitalWrite(DEC1_D, HIGH);
+
+  digitalWrite(DEC2_A, HIGH); digitalWrite(DEC2_B, HIGH);
+  digitalWrite(DEC2_C, HIGH); digitalWrite(DEC2_D, HIGH);
+}
+
+// State awal 7-segment yang selalu sama:
+// 1. tulis 0 (0000) ke register kedua dekoder
+// 2. lalu BLANK (1111)
+void resetSevenSegment() {
+  tampilkanAngka(0);
+  matikanSevenSegment();
+}
+
+// Semua variabel sistem kembali ke nilai awal (fase IDLE)
+void resetVariabel() {
+  fase = FASE_IDLE;
+  sisaWaktu = 0;
+  waktuDetikTerakhir = 0;
+  waktuMulaiHijau = 0;
+  waktuKedipTerakhir = 0;
+  statusLampuKuning = false;
 }

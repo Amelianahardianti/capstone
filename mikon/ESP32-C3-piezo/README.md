@@ -102,7 +102,8 @@ Masuk ke mode download secara manual:
 1. **Tutup Serial Monitor PlatformIO terlebih dahulu**, karena satu port hanya bisa dibuka satu aplikasi.
 2. Tekan `Ctrl+Shift+P`, lalu pilih **Teleplot: Start**.
 3. Pilih port COM ESP32 dan baud `115200`, lalu klik **Open**.
-4. Grafik `raw`, `smooth`, `baseline`, `threshold`, `taps`, dan `peak` akan muncul.
+4. Grafik `raw`, `smooth`, `envelope`, `baseline`, `threshold`, `taps`, dan `peak` akan muncul.
+   Tarik `threshold` ke grafik `envelope` supaya keduanya tampil di satu grafik.
 5. Perintah bisa dikirim lewat kotak teks Teleplot, misalnya `r` lalu Enter.
 
 ### Pilihan B: Arduino IDE 2 Serial Plotter
@@ -136,7 +137,8 @@ base ┤────────╯╰────╯╰───────╯
          terhitung  TIDAK   terhitung
                   (di bawah threshold)
 ```
-- **raw** (garis kasar): nilai ADC apa adanya, termasuk noise.
+- **raw** (garis kasar): nilai ADC apa adanya, termasuk noise. Grafik menerima 1 titik per `PLOT_EVERY_N` sampel, berisi nilai maksimum dari sampel-sampel itu, jadi puncak ketukan tidak hilang.
+- **envelope**: tinggi sinyal yang langsung naik saat ada ketukan lalu turun perlahan. Ketukan yang sangat singkat terlihat sebagai "bukit" lebar. Kalau bukitnya melewati garis threshold, ketukan itu terhitung.
 - **smooth** (garis halus): rata-rata beberapa sampel terakhir. Noise berkurang, tapi puncak sedikit lebih rendah dan sedikit terlambat.
 - **baseline**: nilai saat sensor diam. Seharusnya rata dan dekat 0, karena piezo hanya menghasilkan tegangan positif saat ditekan dan rangkaian memotong sisi negatifnya.
 - Deteksi ketukan selalu memakai sinyal **raw** (lihat `DETECT_ON_SMOOTH`). Mode `r`/`s`/`b` hanya mengubah garis yang ditampilkan.
@@ -215,6 +217,8 @@ Uji tegangan, masih **tanpa ESP32**:
 |---|---|---|
 | `ADC_PIN` | 0 | Pin sensor |
 | `SAMPLE_RATE_HZ` | 200 | Sampel per detik |
+| `PLOT_EVERY_N` | 4 | Kirim 1 titik plot per N sampel (200 Hz / 4 = 50 titik/detik). Lebih besar = grafik lebih lambat |
+| `ENVELOPE_DECAY` | 0.98 | Kecepatan envelope turun setelah puncak. Makin dekat 1 = makin lambat |
 | `SMOOTH_WINDOW` | 8 | Jumlah sampel moving average (tampilan) |
 | `DETECT_ON_SMOOTH` | false | Deteksi ketukan memakai RAW. `true` = pakai SMOOTH (puncak teredam, ketukan singkat bisa terlewat) |
 | `BASELINE_ALPHA` | 0.01 | Kecepatan baseline mengikuti perubahan lambat |

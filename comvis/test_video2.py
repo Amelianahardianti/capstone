@@ -1,8 +1,24 @@
 import cv2
+import os
 import json
+import argparse
+import numpy as np
 import paho.mqtt.client as mqtt
 from ultralytics import YOLO
 import threading
+from video_source import open_source
+
+# =================== 0. ARGUMEN INPUT ===================
+# Contoh:
+#   python test_video2.py                          -> aman.mp4 (default lama)
+#   python test_video2.py --source vid.mp4
+#   python test_video2.py --source "rtsp://..."    -> live stream
+#   set CV_SOURCE=rtsp://...  lalu  python test_video2.py
+parser = argparse.ArgumentParser()
+parser.add_argument("--source", default=os.environ.get("CV_SOURCE", "aman.mp4"),
+                    help="Path video file atau URL RTSP (default: env CV_SOURCE / aman.mp4)")
+parser.add_argument("--rtsp-transport", default="tcp", choices=["tcp", "udp"])
+args = parser.parse_args()
 
 # ===============================================================
 # SMART SAFE WALKING PATH — Final Edge CV Module v6
@@ -11,7 +27,7 @@ import threading
 # ===============================================================
 
 # =================== 1. KONFIGURASI MQTT LOCAL EDGE ===================
-MQTT_BROKER = "10.236.155.191"
+MQTT_BROKER = "10.76.111.208"
 MQTT_PORT   = 1883
 MQTT_TOPIC_PUB = "jalan/status"
 MQTT_TOPIC_SUB = "jalan/trigger"
@@ -49,18 +65,19 @@ except Exception as e:
 print("[CV] Memuat model YOLOv8 Nano...")
 model = YOLO("yolov8n.pt")
 
-# =================== 3. LOAD VIDEO LOKAL ===================
-video_path = "aman.mp4"
-cap = cv2.VideoCapture(video_path)
-
-if not cap.isOpened():
-    print(f"[ERROR] Gagal membuka video: {video_path}")
+# =================== 3. LOAD SUMBER VIDEO (FILE / RTSP) ===================
+try:
+    source = open_source(args.source, transport=args.rtsp_transport)
+except IOError as e:
+    print(f"[ERROR] {e}")
     exit()
 
-video_fps = cap.get(cv2.CAP_PROP_FPS)
-if video_fps <= 0:
-    video_fps = 30.0
-print(f"[INFO] Video FPS: {video_fps:.1f}")
+if source.is_live:
+    print("[INFO] Mode LIVE stream (timestamp = waktu nyata)")
+else:
+    print(f"[INFO] Video FPS: {source.fps:.1f}")
+last_reconnect_count = 0
+WINDOW_NAME = "Smart Safe Walking Path - Edge Analytics"
 
 # =================== 4. PARAMETER KECEPATAN ===================
 JARAK_ANTAR_GARIS_METER = 7.5  
@@ -84,10 +101,22 @@ countdown_val     = 0
 last_tick_time    = 0.0
 
 # =================== 6. LOOP UTAMA ===================
-while cap.isOpened():
-    ret, original_frame = cap.read()
+while True:
+    # current_time_s: file -> waktu video (sinkron meski ngelag), RTSP -> waktu nyata
+    ret, original_frame, current_time_s = source.read()
     if not ret:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if source.is_live:
+            # Belum ada frame baru / sedang reconnect: jaga window tetap responsif
+            status = source.status_text()
+            if status:
+                placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(placeholder, status, (20, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                cv2.imshow(WINDOW_NAME, placeholder)
+            if cv2.waitKey(5) & 0xFF == ord('q'):
+                break
+            continue
+        source.rewind()
         track_data.clear()
         speed_cache.clear()
         ngebut_counter = 0
@@ -95,12 +124,20 @@ while cap.isOpened():
         is_crossing    = False
         continue
 
+    # Setelah reconnect ada jeda waktu: buang state crossing agar
+    # kecepatan tidak dihitung melintasi gap (time_A sebelum putus, time_B sesudah)
+    if source.reconnect_count != last_reconnect_count:
+        last_reconnect_count = source.reconnect_count
+        track_data.clear()
+        speed_cache.clear()
+        print("[RTSP] Reconnect terdeteksi -> state tracking kecepatan di-reset")
+
     frame_count += 1
-    # Gunakan waktu video agar countdown sinkron meskipun video ngelag
-    current_time_s = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-    
-    if frame_count % 2 == 0:
-        continue  
+
+    # Frame skipping hanya untuk file. Pada RTSP, reader thread sudah
+    # otomatis membuang frame lama sehingga yang diproses selalu frame terbaru.
+    if not source.is_live and frame_count % 2 == 0:
+        continue
 
     # ---- ROI ----
     h_orig, w_orig = original_frame.shape[:2]
@@ -299,7 +336,7 @@ while cap.isOpened():
                 f"Jarak garis: {JARAK_ANTAR_GARIS_METER}m | Threshold: {SPEED_THRESHOLD_KMH}km/h",
                 (10, h_roi - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
 
-    cv2.imshow("Smart Safe Walking Path - Edge Analytics", frame)
+    cv2.imshow(WINDOW_NAME, frame)
     
     # Deteksi Keyboard
     key = cv2.waitKey(1) & 0xFF
@@ -316,7 +353,7 @@ while cap.isOpened():
                 print(f"[SIMULASI] Menyeberang dengan jatah waktu {countdown_val} detik.")
 
 # =================== 10. CLEANUP ===================
-cap.release()
+source.release()
 cv2.destroyAllWindows()
 if mqtt_connected:
     client.loop_stop()
