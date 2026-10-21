@@ -14,10 +14,12 @@
 //   1. IDLE  : hanya Kuning kedip. Merah & Hijau mati, PJU mati, layar mati.
 //              Menunggu push button / sensor pejalan kaki (piezo + ultrasonik)
 //              ATAU pesan START dari node lain.
-//   2. TIMER : Merah nyala, PILOT nyala, 7-segment hitung mundur 15 -> 0,
+//   2. PREPARING : 3 detik setelah trigger. Kuning TETAP kedip, buzzer bunyi
+//              panjang (tanda trigger diterima), countdown belum jalan.
+//   3. TIMER : Merah nyala, PILOT nyala, PJU sesuai LDR, 7-segment 15 -> 0,
 //              buzzer bunyi. LDR dibaca oleh node yang tombolnya ditekan,
 //              hasilnya (PJU on/off) dibagikan ke node lain.
-//   3. HIJAU : (setelah countdown habis) Hijau nyala 7 detik, Kuning mati.
+//   4. HIJAU : (setelah countdown habis) Hijau nyala 7 detik, Kuning mati.
 //   -> kembali ke IDLE (PJU dimatikan, kuning kedip lagi).
 //
 // Sinkronisasi:
@@ -61,6 +63,7 @@ void resetSevenSegment();
 bool tombolDitekan();
 bool pejalanKakiTerdeteksi(unsigned long sekarang);
 void IRAM_ATTR isrEcho();
+void terapkanPJU();
 void kalibrasiSensor();
 void kirimLog(const char* sub, bool retain, const char* format, ...);
 void mulaiSiklusLokal(unsigned long sekarang, const char* pemicu);
@@ -150,8 +153,18 @@ const bool LOG_SENSOR = false;                  // true = kirim data sensor (for
 const bool LOG_SENSOR_MQTT = true;              // false = matikan sensor_live
 const unsigned long INTERVAL_SENSOR_LIVE_MS = 500;
 
-// Angka 15..0 masing-masing tampil 1 detik -> fase TIMER = 16 detik
-const unsigned long MS_TIMER  = (DURASI_TIMER + 1) * 1000UL;
+// Jeda setelah trigger (push button / sensor) sebelum countdown, ditandai buzzer panjang
+// (buzzer panjang 5 detik + diam 1 detik = 6 detik)
+const unsigned long DURASI_PREPARING_MS = 6000;
+// Buzzer panjang berhenti sebentar sebelum countdown, agar beep countdown terdengar terpisah
+const unsigned long BUZZER_JEDA_PREP_MS = 1000;
+
+// Posisi siklus (ms sejak trigger):
+//   0 .. MS_PREP          -> PREPARING
+//   MS_PREP .. MS_TIMER   -> TIMER (angka 15..0 masing-masing 1 detik = 16 detik)
+//   MS_TIMER .. MS_SIKLUS -> HIJAU
+const unsigned long MS_PREP   = DURASI_PREPARING_MS;
+const unsigned long MS_TIMER  = MS_PREP + (DURASI_TIMER + 1) * 1000UL;
 const unsigned long MS_SIKLUS = MS_TIMER + DURASI_HIJAU_MS;
 
 // Sinkronisasi
@@ -234,9 +247,9 @@ volatile unsigned long waktuNowTerakhir = 0;   // millis() paket ESP-NOW terakhi
 char peerNowTerakhir[16] = "";
 
 // ================= VARIABEL SISTEM ================= //
-enum FaseSistem { FASE_IDLE, FASE_TIMER, FASE_HIJAU };
+enum FaseSistem { FASE_IDLE, FASE_PREP, FASE_TIMER, FASE_HIJAU };
 FaseSistem fase = FASE_IDLE;
-const char* NAMA_FASE[] = { "IDLE", "TIMER", "HIJAU" };
+const char* NAMA_FASE[] = { "IDLE", "PREPARING", "TIMER", "HIJAU" };
 
 uint32_t idSiklus = 0;                 // 0 = tidak ada siklus berjalan
 uint32_t idSiklusSelesai = 0;          // siklus terakhir yang sudah selesai
@@ -380,11 +393,13 @@ void loop() {
 
 // Dipanggil saat push button ditekan / sensor mendeteksi pejalan kaki di fase IDLE
 void mulaiSiklusLokal(unsigned long sekarang, const char* pemicu) {
-  // LDR hanya dibaca saat siklus dipicu, hasilnya dibagikan ke node lain
+  // LDR hanya dibaca SEKALI saat siklus dipicu, hasilnya dibagikan ke node lain.
+  // Keputusan PJU terkunci sampai siklus selesai (tidak dibaca ulang saat
+  // countdown/hijau), jadi PJU tidak berkedip-kedip walau cahaya berubah.
   int bacaanLDR = digitalRead(PIN_LDR);
   bool gelap = (bacaanLDR == LDR_GELAP);
 
-  Serial.printf("\n%s -> TIMER MULAI -> MERAH\n", pemicu);
+  Serial.printf("\n%s -> PREPARING %lu ms (BUZZER PANJANG)\n", pemicu, MS_PREP);
   Serial.printf("LDR DO: %s -> %s -> PJU: %s\n",
                 bacaanLDR == HIGH ? "HIGH" : "LOW",
                 gelap ? "GELAP" : "TERANG",
@@ -399,17 +414,31 @@ void aturSiklus(uint32_t id, const char* pemilik, bool pju, uint32_t posisi, uns
   idSiklus = id;
   strlcpy(pemilikSiklus, pemilik, sizeof(pemilikSiklus));
   statusPJU = pju;
-  digitalWrite(PIN_PJU, pju ? RELAY_ON : RELAY_OFF);
   waktuMulaiSiklus = sekarang - posisi;
   angkaTampil = -1; // paksa 7-segment ditulis ulang
   updateSiklus(sekarang);
+  terapkanPJU(); // keputusan PJU bisa berubah (konflik siklus) walau fase sama
+}
+
+// PJU baru dinyalakan saat penyeberangan benar-benar dimulai (TIMER & HIJAU),
+// bukan saat PREPARING
+void terapkanPJU() {
+  bool nyala = statusPJU && (fase == FASE_TIMER || fase == FASE_HIJAU);
+  digitalWrite(PIN_PJU, nyala ? RELAY_ON : RELAY_OFF);
 }
 
 void gantiFase(FaseSistem baru, unsigned long sekarang) {
   fase = baru;
   switch (baru) {
+    case FASE_PREP:
+      Serial.printf("FASE: PREPARING (siklus %08lX, pemilik %s) -> countdown dalam %lu ms\n",
+                    (unsigned long)idSiklus, pemilikSiklus,
+                    MS_PREP - min(MS_PREP, sekarang - waktuMulaiSiklus));
+      break;
+
     case FASE_TIMER:
       digitalWrite(PIN_PILOT, HIGH);
+      terapkanPJU();
       Serial.printf("FASE: MERAH (siklus %08lX, pemilik %s)\n",
                     (unsigned long)idSiklus, pemilikSiklus);
       break;
@@ -423,8 +452,8 @@ void gantiFase(FaseSistem baru, unsigned long sekarang) {
 
     case FASE_IDLE:
       digitalWrite(PIN_PILOT, LOW);
-      digitalWrite(PIN_PJU, RELAY_OFF); // PJU mati, siap untuk penyeberang berikutnya
       statusPJU = false;
+      terapkanPJU(); // PJU mati, siap untuk penyeberang berikutnya
       resetSevenSegment();
       angkaTampil = -1;
       idSiklusSelesai = idSiklus;
@@ -443,13 +472,14 @@ void updateSiklus(unsigned long sekarang) {
   if (idSiklus == 0) return;
 
   unsigned long posisi = sekarang - waktuMulaiSiklus;
-  FaseSistem target = (posisi < MS_TIMER)  ? FASE_TIMER
+  FaseSistem target = (posisi < MS_PREP)   ? FASE_PREP
+                    : (posisi < MS_TIMER)  ? FASE_TIMER
                     : (posisi < MS_SIKLUS) ? FASE_HIJAU
                     : FASE_IDLE;
   if (target != fase) gantiFase(target, sekarang);
 
   if (fase == FASE_TIMER) {
-    int angka = DURASI_TIMER - (int)(posisi / 1000);
+    int angka = DURASI_TIMER - (int)((posisi - MS_PREP) / 1000);
     if (angka != angkaTampil) {
       angkaTampil = angka;
       tampilkanAngka(angka);
@@ -626,7 +656,7 @@ void publishMqtt(const PesanSync& p) {
   doc["pos"]  = posisi;
   doc["fase"] = NAMA_FASE[p.fase];
   doc["pju"]  = p.pju;
-  if (p.fase == FASE_TIMER) doc["sisa"] = DURASI_TIMER - (int)(posisi / 1000);
+  if (p.fase == FASE_TIMER) doc["sisa"] = DURASI_TIMER - (int)((posisi - MS_PREP) / 1000);
 
   char buf[200];
   size_t n = serializeJson(doc, buf, sizeof(buf));
@@ -764,9 +794,9 @@ void taskJaringan(void* pvParameters) {
 // ================= FUNGSI BANTUAN ================= //
 
 // Lampu traffic light sesuai fase:
-// IDLE  = kuning kedip | TIMER = merah | HIJAU = hijau
+// IDLE / PREPARING = kuning kedip | TIMER = merah | HIJAU = hijau
 void updateLampu(unsigned long sekarang) {
-  if (fase == FASE_IDLE) {
+  if (fase == FASE_IDLE || fase == FASE_PREP) {
     if (sekarang - waktuKedipTerakhir >= KEDIP_KUNING_MS) {
       statusLampuKuning = !statusLampuKuning;
       waktuKedipTerakhir = sekarang;
@@ -780,14 +810,17 @@ void updateLampu(unsigned long sekarang) {
   digitalWrite(LAMPU_KUNING, statusLampuKuning  ? RELAY_ON : RELAY_OFF);
 }
 
-// Pola buzzer sama seperti kode tes (hanya saat timer jalan):
-// sisa 15-4: bunyi 500 ms, diam 500 ms (1 beep per detik)
-// sisa 3-0 : 4 beep cepat per detik (bunyi 125 ms, diam 125 ms)
+// Pola buzzer:
+// PREPARING : bunyi panjang (tanda trigger), berhenti BUZZER_JEDA_PREP_MS sebelum countdown
+// TIMER sisa 15-4: bunyi 500 ms, diam 500 ms (1 beep per detik)
+// TIMER sisa 3-0 : 4 beep cepat per detik (bunyi 125 ms, diam 125 ms)
 // Ikut posisi siklus, jadi bunyi kedua node juga sinkron.
 void updateBuzzer(unsigned long sekarang) {
   bool bunyi = false;
-  if (fase == FASE_TIMER) {
-    unsigned long posisi = (sekarang - waktuMulaiSiklus) % 1000; // 0-999 ms di detik ini
+  if (fase == FASE_PREP) {
+    bunyi = (sekarang - waktuMulaiSiklus) < (MS_PREP - BUZZER_JEDA_PREP_MS);
+  } else if (fase == FASE_TIMER) {
+    unsigned long posisi = (sekarang - waktuMulaiSiklus - MS_PREP) % 1000; // 0-999 ms di detik ini
     if (angkaTampil >= 4) {
       bunyi = (posisi < 500);
     } else {
