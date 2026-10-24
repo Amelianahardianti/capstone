@@ -155,6 +155,8 @@ const bool LOG_SENSOR = false;                  // true = kirim data sensor (for
 //   penyeberangan/node/<id>/sensor      -> tiap kali sensor LOLOS memicu siklus (retained)
 //   penyeberangan/node/<id>/sensor_live -> data sensor berkala (JSON, untuk grafik)
 const bool LOG_SENSOR_MQTT = true;              // false = matikan sensor_live
+// true = nilai piezo & jarak ultrasonik juga tampil rapi di topik log (kategori SENSOR)
+const bool SENSOR_DI_LOG = true;
 const unsigned long INTERVAL_SENSOR_LIVE_MS = 500;
 
 // Jeda setelah trigger (push button / sensor) sebelum countdown, ditandai buzzer panjang
@@ -236,6 +238,7 @@ struct PesanLog {
 };
 QueueHandle_t qLog  = NULL;
 QueueHandle_t qLive = NULL;    // panjang 1, selalu ditimpa data sensor terbaru
+QueueHandle_t qLiveTeks = NULL; // sama, tapi baris rapi untuk topik log
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -347,7 +350,8 @@ void setup() {
   qTerima = xQueueCreate(10, sizeof(PesanSync));
   qLog    = xQueueCreate(20, sizeof(PesanLog)); // cukup untuk log boot sebelum MQTT tersambung
   qLive   = xQueueCreate(1, sizeof(PesanLog));
-  if (qKirim == NULL || qTerima == NULL || qLog == NULL || qLive == NULL) {
+  qLiveTeks = xQueueCreate(1, sizeof(PesanLog));
+  if (qKirim == NULL || qTerima == NULL || qLog == NULL || qLive == NULL || qLiveTeks == NULL) {
     Serial.println("FATAL: QUEUE GAGAL DIBUAT");
     while (1) delay(1000);
   }
@@ -777,7 +781,8 @@ void taskJaringan(void* pvParameters) {
 
     // Log sensor: tetap di antrian sampai MQTT tersambung
     PesanLog lg;
-    while (mqttOk && (xQueueReceive(qLog, &lg, 0) == pdTRUE || xQueueReceive(qLive, &lg, 0) == pdTRUE)) {
+    while (mqttOk && (xQueueReceive(qLog, &lg, 0) == pdTRUE || xQueueReceive(qLive, &lg, 0) == pdTRUE ||
+                      xQueueReceive(qLiveTeks, &lg, 0) == pdTRUE)) {
       char topik[64];
       snprintf(topik, sizeof(topik), "penyeberangan/node/%s/%s", idNode, lg.sub);
       mqtt.publish(topik, lg.isi, lg.retain);
@@ -1051,14 +1056,18 @@ void kirimTopik(const char* sub, bool retain, const char* format, ...) {
 
 // Satu baris log rapi: "[A 00:01:23] KATEGORI  | pesan"
 // Ke Serial, dan (jika keMqtt) ke topik penyeberangan/node/<id>/log
+void formatBaris(char* keluar, size_t ukuran, const char* tag, const char* isi) {
+  unsigned long d = millis() / 1000;
+  snprintf(keluar, ukuran, "[%s %02lu:%02lu:%02lu] %-10s| %s",
+           idNode, d / 3600, (d / 60) % 60, d % 60, tag, isi);
+}
+
 void tulisLog(bool keMqtt, const char* tag, const char* format, va_list args) {
   char isi[150];
   vsnprintf(isi, sizeof(isi), format, args);
 
-  unsigned long d = millis() / 1000;
   PesanLog lg = {};
-  snprintf(lg.isi, sizeof(lg.isi), "[%s %02lu:%02lu:%02lu] %-10s| %s",
-           idNode, d / 3600, (d / 60) % 60, d % 60, tag, isi);
+  formatBaris(lg.isi, sizeof(lg.isi), tag, isi);
   Serial.println(lg.isi);
 
   if (keMqtt && qLog != NULL) {
@@ -1100,6 +1109,26 @@ void kirimSensorLive(unsigned long sekarang) {
            (unsigned long)echoIsrHitung, digitalRead(PIN_ECHO));
   echoIsrHitung = 0;
   xQueueOverwrite(qLive, &lg);
+
+  // Baris rapi untuk terminal, contoh:
+  // [A 00:01:23] SENSOR    | Piezo  512 / ambang 1097 [  -  ]  |  Jarak  85.3 cm / batas 150.0 cm [AKTIF]
+  if (SENSOR_DI_LOG) {
+    char jarakTeks[8];
+    if (jarakCm >= 400.0f) strlcpy(jarakTeks, " >400", sizeof(jarakTeks)); // tidak ada benda
+    else snprintf(jarakTeks, sizeof(jarakTeks), "%5.1f", jarakCm);
+
+    char isi[150];
+    snprintf(isi, sizeof(isi),
+             "Piezo %4d / ambang %4.0f %s  |  Jarak %s cm / batas %5.1f cm %s",
+             piezoLiveMaks, piezoBaseline + ambangPiezo(), piezoAktif ? "[AKTIF]" : "[  -  ]",
+             jarakTeks, batasJarak, ultraDeteksi ? "[AKTIF]" : "[  -  ]");
+
+    PesanLog baris = {};
+    formatBaris(baris.isi, sizeof(baris.isi), "SENSOR", isi);
+    Serial.println(baris.isi);
+    strlcpy(baris.sub, "log", sizeof(baris.sub));
+    xQueueOverwrite(qLiveTeks, &baris); // hanya yang terbaru, tidak menumpuk saat MQTT putus
+  }
   piezoLiveMaks = 0;
 }
 
@@ -1117,7 +1146,7 @@ bool pejalanKakiTerdeteksi(unsigned long sekarang) {
   sebelumnya = deteksi;
 
   if (tepiNaik && fase == FASE_IDLE) {
-    catat("SENSOR", "Lolos: piezo %d (ambang %.0f), jarak %.1f cm (batas %.1f cm)",
+    catat("LOLOS", "Piezo + ultrasonik terdeteksi: piezo %d (ambang %.0f), jarak %.1f cm (batas %.1f cm)",
          piezoKetukan, piezoBaseline + ambangPiezo(), jarakCm, batasJarak);
     kirimTopik("sensor", true, "LOLOS: piezo %d (ambang %.0f), jarak %.1f cm (batas %.1f cm)",
                piezoKetukan, piezoBaseline + ambangPiezo(), jarakCm, batasJarak);
