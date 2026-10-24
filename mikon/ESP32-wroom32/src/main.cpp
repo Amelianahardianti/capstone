@@ -65,7 +65,9 @@ bool pejalanKakiTerdeteksi(unsigned long sekarang);
 void IRAM_ATTR isrEcho();
 void terapkanPJU();
 void kalibrasiSensor();
-void kirimLog(const char* sub, bool retain, const char* format, ...);
+void kirimTopik(const char* sub, bool retain, const char* format, ...);
+void catat(const char* tag, const char* format, ...);
+void catatSerial(const char* tag, const char* format, ...);
 void mulaiSiklusLokal(unsigned long sekarang, const char* pemicu);
 void aturSiklus(uint32_t id, const char* pemilik, bool pju, uint32_t posisi, unsigned long sekarang);
 void updateSiklus(unsigned long sekarang);
@@ -83,11 +85,12 @@ const int PIN_BUTTON = 32;
 const int PIN_LDR = 34; // Dihubungkan ke pin DO pada modul LDR
 
 // Sensor pejalan kaki (pemicu selain push button)
-// GPIO34-39 hanya bisa INPUT, jadi TRIG (output) di 23 dan ECHO (input) di 39.
+// GPIO34-39 hanya bisa INPUT, jadi TRIG (output) di 23. ECHO di 5 (bukan pin ADC1,
+// agar pulsa ECHO tidak mengganggu pembacaan ADC piezo).
 // ECHO SRF05 bertegangan 5V -> pakai pembagi tegangan ke 3,3V!
 const int PIN_PIEZO = 35; // ADC1_CH7 (ADC1 tetap bisa dipakai saat WiFi aktif)
 const int PIN_TRIG  = 23;
-const int PIN_ECHO  = 39;
+const int PIN_ECHO  = 5;
 
 // Pin Output Lampu (modul relay)
 const int PIN_PJU = 2;
@@ -129,7 +132,7 @@ const unsigned long KALIBRASI_MS = 3000;
 // Piezo: dianggap "ada injakan" jika puncak sinyal melebihi baseline (nilai diam)
 // sebanyak ambang. Ambang = nilai terbesar dari 3 hal di bawah, jadi otomatis
 // ikut naik kalau noise-nya besar. Makin besar angkanya = makin TIDAK sensitif.
-const int   PIEZO_DELTA_MIN    = 150;   // ambang minimum di atas baseline (ADC 0-4095)
+const int   PIEZO_DELTA_MIN    = 400;   // ambang minimum di atas baseline (ADC 0-4095)
 const float PIEZO_FAKTOR_NOISE = 5.0;   // ambang >= faktor x rata-rata noise
 const float PIEZO_FAKTOR_KALIB = 1.5;   // ambang >= 1,5 x lonjakan terbesar saat kalibrasi
 const float PIEZO_ALPHA        = 0.01;  // kecepatan baseline/noise menyesuaikan (per 10 ms)
@@ -146,7 +149,8 @@ const unsigned long INTERVAL_ULTRA_MS = 100;    // trigger SRF05 tiap 100 ms
 const unsigned long INTERVAL_PIEZO_MS = 10;     // evaluasi puncak piezo tiap 10 ms
 const bool LOG_SENSOR = false;                  // true = kirim data sensor (format Teleplot)
 
-// Pemantauan sensor lewat MQTT (tanpa kabel USB), lihat di laptop:
+// Pemantauan lewat MQTT (tanpa kabel USB), lihat di laptop:
+//   penyeberangan/node/<id>/log         -> log kejadian yang rapi (sama dengan Serial Monitor)
 //   penyeberangan/node/<id>/kalibrasi   -> hasil kalibrasi saat boot (retained)
 //   penyeberangan/node/<id>/sensor      -> tiap kali sensor LOLOS memicu siklus (retained)
 //   penyeberangan/node/<id>/sensor_live -> data sensor berkala (JSON, untuk grafik)
@@ -339,16 +343,17 @@ void setup() {
   snprintf(topicStatus, sizeof(topicStatus), "penyeberangan/node/%s/status", idNode);
   snprintf(topicOnline, sizeof(topicOnline), "penyeberangan/node/%s/online", idNode);
 
-  Serial.printf("\n=== ESP32 START — NODE %s ===\n", idNode);
-
   qKirim  = xQueueCreate(10, sizeof(PesanSync));
   qTerima = xQueueCreate(10, sizeof(PesanSync));
-  qLog    = xQueueCreate(8, sizeof(PesanLog));
+  qLog    = xQueueCreate(20, sizeof(PesanLog)); // cukup untuk log boot sebelum MQTT tersambung
   qLive   = xQueueCreate(1, sizeof(PesanLog));
   if (qKirim == NULL || qTerima == NULL || qLog == NULL || qLive == NULL) {
     Serial.println("FATAL: QUEUE GAGAL DIBUAT");
     while (1) delay(1000);
   }
+
+  Serial.println();
+  catat("BOOT", "================ ESP32 START - NODE %s ================", idNode);
 
   // Jaringan di core 0, logika lampu tetap di loop() (core 1)
   xTaskCreatePinnedToCore(taskJaringan, "Task_Jaringan", 6144, NULL, 1, NULL, 0);
@@ -357,7 +362,7 @@ void setup() {
   kalibrasiSensor();
 
   waktuKedipTerakhir = millis();
-  Serial.println("=== SISTEM SIAP: IDLE (KUNING KEDIP) ===");
+  catat("BOOT", "Sistem siap -> IDLE (kuning kedip), menunggu push button / sensor");
 }
 
 // ================= LOOP UTAMA ================= //
@@ -375,8 +380,8 @@ void loop() {
 
   // Tombol / sensor hanya memulai siklus saat IDLE
   if (fase == FASE_IDLE) {
-    if (ditekan) mulaiSiklusLokal(sekarang, "TOMBOL DITEKAN");
-    else if (adaPejalan) mulaiSiklusLokal(sekarang, "SENSOR: PEJALAN KAKI TERDETEKSI (PIEZO + ULTRASONIK)");
+    if (ditekan) mulaiSiklusLokal(sekarang, "Push button ditekan");
+    else if (adaPejalan) mulaiSiklusLokal(sekarang, "Pejalan kaki terdeteksi (piezo + ultrasonik)");
   }
 
   updateSiklus(sekarang);
@@ -399,11 +404,11 @@ void mulaiSiklusLokal(unsigned long sekarang, const char* pemicu) {
   int bacaanLDR = digitalRead(PIN_LDR);
   bool gelap = (bacaanLDR == LDR_GELAP);
 
-  Serial.printf("\n%s -> PREPARING %lu ms (BUZZER PANJANG)\n", pemicu, MS_PREP);
-  Serial.printf("LDR DO: %s -> %s -> PJU: %s\n",
-                bacaanLDR == HIGH ? "HIGH" : "LOW",
-                gelap ? "GELAP" : "TERANG",
-                gelap ? "ON" : "OFF");
+  catat("SIKLUS", "------------------- SIKLUS BARU -------------------");
+  catat("TRIGGER", "%s", pemicu);
+  catat("LDR", "%s (DO %s) -> PJU %s selama penyeberangan (terkunci)",
+       gelap ? "GELAP" : "TERANG", bacaanLDR == HIGH ? "HIGH" : "LOW",
+       gelap ? "ON" : "OFF");
 
   aturSiklus(esp_random() | 1, idNode, gelap, 0, sekarang); // |1 agar id tidak pernah 0
   kirimState("START", sekarang);
@@ -431,23 +436,24 @@ void gantiFase(FaseSistem baru, unsigned long sekarang) {
   fase = baru;
   switch (baru) {
     case FASE_PREP:
-      Serial.printf("FASE: PREPARING (siklus %08lX, pemilik %s) -> countdown dalam %lu ms\n",
-                    (unsigned long)idSiklus, pemilikSiklus,
-                    MS_PREP - min(MS_PREP, sekarang - waktuMulaiSiklus));
+      catat("FASE", "PREPARING : buzzer panjang %lu s + diam %lu s, countdown dalam %lu ms",
+           (MS_PREP - BUZZER_JEDA_PREP_MS) / 1000, BUZZER_JEDA_PREP_MS / 1000,
+           MS_PREP - min(MS_PREP, sekarang - waktuMulaiSiklus));
+      catat("FASE", "            siklus %08lX, pemilik node %s",
+           (unsigned long)idSiklus, pemilikSiklus);
       break;
 
     case FASE_TIMER:
       digitalWrite(PIN_PILOT, HIGH);
       terapkanPJU();
-      Serial.printf("FASE: MERAH (siklus %08lX, pemilik %s)\n",
-                    (unsigned long)idSiklus, pemilikSiklus);
+      catat("FASE", "MERAH     : countdown %d s, PJU %s", DURASI_TIMER, statusPJU ? "ON" : "OFF");
       break;
 
     case FASE_HIJAU:
       digitalWrite(PIN_PILOT, LOW);
       resetSevenSegment();
       angkaTampil = -1;
-      Serial.println("TIMER SELESAI -> HIJAU 7 DETIK");
+      catat("FASE", "HIJAU     : %lu s", DURASI_HIJAU_MS / 1000);
       break;
 
     case FASE_IDLE:
@@ -461,7 +467,7 @@ void gantiFase(FaseSistem baru, unsigned long sekarang) {
       pemilikSiklus[0] = '\0';
       waktuKedipTerakhir = sekarang; // kedip kuning mulai dari awal
       statusLampuKuning = false;
-      Serial.println("HIJAU SELESAI -> PJU OFF -> IDLE (KUNING KEDIP)");
+      catat("FASE", "IDLE      : siklus selesai, PJU OFF, kuning kedip");
       break;
   }
   kirimState("FASE", sekarang);
@@ -483,7 +489,7 @@ void updateSiklus(unsigned long sekarang) {
     if (angka != angkaTampil) {
       angkaTampil = angka;
       tampilkanAngka(angka);
-      Serial.printf("COUNTDOWN: %d\n", angka);
+      catat("COUNTDOWN", "%2d", angka);
     }
   }
 }
@@ -500,9 +506,10 @@ void prosesPesanPeer(const PesanSync& p) {
     // Heartbeat telat dari siklus yang baru saja kita selesaikan -> abaikan
     if (p.idSiklus == idSiklusSelesai) return;
 
-    Serial.printf("\nSYNC: IKUT SIKLUS %08lX DARI NODE %s via %s (%s, posisi %lu ms)\n",
-                  (unsigned long)p.idSiklus, p.asal, NAMA_JALUR[p.jalur], p.evt,
-                  (unsigned long)posisi);
+    catat("SIKLUS", "------------------- SIKLUS BARU -------------------");
+    catat("SYNC", "Ikut siklus %08lX dari node %s via %s (%s, posisi %lu ms)",
+         (unsigned long)p.idSiklus, p.asal, NAMA_JALUR[p.jalur], p.evt,
+         (unsigned long)posisi);
     aturSiklus(p.idSiklus, p.asal, p.pju, posisi, sekarang);
 
   } else if (p.idSiklus == idSiklus) {
@@ -513,15 +520,15 @@ void prosesPesanPeer(const PesanSync& p) {
 
     long selisih = (long)(sekarang - waktuMulaiSiklus) - (long)posisi;
     if (labs(selisih) > TOLERANSI_SYNC_MS) {
-      Serial.printf("SYNC: KOREKSI DRIFT %ld ms\n", selisih);
+      catat("SYNC", "Koreksi drift %ld ms", selisih);
       waktuMulaiSiklus = sekarang - posisi;
       updateSiklus(sekarang);
     }
 
   } else if (p.idSiklus < idSiklus) {
     // Tombol ditekan hampir bersamaan di kedua sisi: id terkecil menang
-    Serial.printf("SYNC: KONFLIK SIKLUS, IKUT %08lX DARI NODE %s via %s\n",
-                  (unsigned long)p.idSiklus, p.asal, NAMA_JALUR[p.jalur]);
+    catat("SYNC", "Konflik siklus, ikut %08lX dari node %s via %s",
+         (unsigned long)p.idSiklus, p.asal, NAMA_JALUR[p.jalur]);
     aturSiklus(p.idSiklus, p.asal, p.pju, posisi, sekarang);
   }
   // p.idSiklus > idSiklus: node lain yang akan mengikuti siklus kita
@@ -665,13 +672,12 @@ void publishMqtt(const PesanSync& p) {
 }
 
 void hubungkanMQTT() {
-  Serial.print("MQTT: menghubungkan... ");
   if (mqtt.connect(clientId, nullptr, nullptr, topicOnline, 1, true, "offline")) {
-    Serial.println("TERHUBUNG");
+    catat("MQTT", "Terhubung ke broker %s:%u", MQTT_HOST, MQTT_PORT);
     mqtt.publish(topicOnline, "online", true);
     mqtt.subscribe(TOPIC_SYNC);
   } else {
-    Serial.printf("GAGAL (rc=%d)\n", mqtt.state());
+    catatSerial("MQTT", "Gagal terhubung ke broker %s:%u (rc=%d)", MQTT_HOST, MQTT_PORT, mqtt.state());
   }
 }
 
@@ -688,9 +694,9 @@ void taskJaringan(void* pvParameters) {
 
   if (mulaiEspNow()) {
     espNowSiap = true;
-    Serial.printf("ESP-NOW: SIAP (channel %u)\n", channel);
+    catat("ESP-NOW", "Siap (channel %u)", channel);
   } else {
-    Serial.println("ESP-NOW: GAGAL INIT");
+    catat("ESP-NOW", "GAGAL init");
   }
 
   espClient.setTimeout(1);   // connect TCP ke broker maks ~1 s (default 3 s)
@@ -699,7 +705,7 @@ void taskJaringan(void* pvParameters) {
   mqtt.setKeepAlive(5);      // broker cepat tahu kalau node mati (LWT)
   mqtt.setSocketTimeout(2);
 
-  Serial.println("WIFI: menyambung...");
+  catatSerial("WIFI", "Menyambung ke \"%s\"...", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS, channel);
   StatusWifi status = ST_MENYAMBUNG;
   unsigned long waktuStatus = millis();   // kapan masuk status sekarang
@@ -717,17 +723,18 @@ void taskJaringan(void* pvParameters) {
         if (terhubung) {
           channel = WiFi.channel();
           if (prefs.getUChar("ch", 0) != channel) prefs.putUChar("ch", channel);
-          Serial.printf("WIFI: TERHUBUNG, IP %s, channel %u\n",
-                        WiFi.localIP().toString().c_str(), channel);
+          catat("WIFI", "Terhubung, IP %s, channel %u",
+               WiFi.localIP().toString().c_str(), channel);
           status = ST_ONLINE;
           waktuCobaMQTT = sekarang - MQTT_RETRY_MS; // langsung coba MQTT
         } else if (sekarang - waktuStatus >= WIFI_TIMEOUT_MS || (sedangSiklus && !peerSenyap)) {
           // Siklus mulai & node lain masih terdengar -> jangan ganggu ESP-NOW dengan scan
-          Serial.println(sedangSiklus && !peerSenyap ? "WIFI: percobaan dibatalkan (siklus berjalan)"
-                                                     : "WIFI: gagal tersambung");
+          catat("WIFI", "%s -> OFFLINE, sinkron lewat ESP-NOW saja (channel %u)",
+               sedangSiklus && !peerSenyap ? "Percobaan dibatalkan (siklus berjalan)"
+                                           : "Gagal tersambung",
+               channel);
           WiFi.disconnect();
           kunciChannel(channel);
-          Serial.printf("WIFI: OFFLINE -> sinkron lewat ESP-NOW saja (channel %u)\n", channel);
           status = ST_OFFLINE;
           waktuStatus = sekarang;
         }
@@ -738,7 +745,7 @@ void taskJaringan(void* pvParameters) {
           mqtt.disconnect();
           WiFi.disconnect();
           kunciChannel(channel);
-          Serial.printf("WIFI: TERPUTUS -> sinkron lewat ESP-NOW saja (channel %u)\n", channel);
+          catat("WIFI", "Terputus -> sinkron lewat ESP-NOW saja (channel %u)", channel);
           status = ST_OFFLINE;
           waktuStatus = sekarang;
         }
@@ -747,8 +754,8 @@ void taskJaringan(void* pvParameters) {
       case ST_OFFLINE:
         if (peerSenyap ? (sekarang - waktuStatus >= WIFI_RETRY_CEPAT_MS)
                        : (!sedangSiklus && sekarang - waktuStatus >= WIFI_RETRY_MS)) {
-          Serial.printf("WIFI: mencoba sambung ulang%s...\n",
-                        peerSenyap ? " (node lain tidak terdengar via ESP-NOW)" : "");
+          catatSerial("WIFI", "Mencoba sambung ulang%s...",
+                     peerSenyap ? " (node lain tidak terdengar via ESP-NOW)" : "");
           WiFi.begin(WIFI_SSID, WIFI_PASS, channel);
           status = ST_MENYAMBUNG;
           waktuStatus = sekarang;
@@ -779,12 +786,14 @@ void taskJaringan(void* pvParameters) {
     // Ringkasan link berkala, untuk memantau saat uji WiFi putus/nyambung
     if (sekarang - waktuLog >= LOG_LINK_MS) {
       waktuLog = sekarang;
+      // Hanya ke Serial: tiap 10 s, akan memenuhi tampilan log MQTT
       unsigned long terakhir = waktuNowTerakhir;
-      Serial.printf("LINK: WiFi=%s ch=%u MQTT=%s | ESP-NOW: ",
-                    NAMA_STATUS_WIFI[status], channel, mqttOk ? "OK" : "-");
-      if (terakhir == 0) Serial.println("belum ada paket dari node lain");
-      else Serial.printf("node %s, %.1f s lalu\n", peerNowTerakhir,
-                         (millis() - terakhir) / 1000.0f);
+      char infoNow[48];
+      if (terakhir == 0) strlcpy(infoNow, "belum ada paket dari node lain", sizeof(infoNow));
+      else snprintf(infoNow, sizeof(infoNow), "node %s, %.1f s lalu", peerNowTerakhir,
+                    (millis() - terakhir) / 1000.0f);
+      catatSerial("LINK", "WiFi %-10s ch %-2u MQTT %-3s ESP-NOW %s",
+                 NAMA_STATUS_WIFI[status], channel, mqttOk ? "OK" : "-", infoNow);
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -965,8 +974,8 @@ void kalibrasiSensor() {
   int nPiezo = 0, nJarak = 0, puncak = 0;
   bool bacaanPertama = true;
 
-  Serial.printf("=== KALIBRASI SENSOR %lu DETIK: jangan injak piezo / berdiri di depan sensor ===\n",
-                KALIBRASI_MS / 1000);
+  catat("KALIBRASI", "Mulai %lu s: jangan injak piezo / berdiri di depan ultrasonik",
+       KALIBRASI_MS / 1000);
 
   unsigned long mulai = millis();
   unsigned long waktuWindow = mulai;
@@ -1014,16 +1023,22 @@ void kalibrasiSensor() {
   ultraHitung = 0;
   ultraDeteksi = false;
 
-  kirimLog("kalibrasi", true,
-           "PIEZO: baseline %.0f, noise rata-rata %.1f, lonjakan maks %d -> ambang %.0f | "
-           "ULTRASONIK: jarak latar %.1f cm -> terdeteksi jika < %.1f cm%s",
-           piezoBaseline, piezoNoise, maks, piezoBaseline + ambangPiezo(),
-           jarakLatar, batasJarak,
-           batasJarak < 10 ? " | PERINGATAN: ada benda terlalu dekat dengan ultrasonik saat kalibrasi!" : "");
+  float ambang = piezoBaseline + ambangPiezo();
+  catat("KALIBRASI", "Piezo : diam %.0f, noise %.1f, lonjakan maks %d -> ambang %.0f",
+       piezoBaseline, piezoNoise, maks, ambang);
+  catat("KALIBRASI", "Ultra : latar %.1f cm -> terdeteksi jika < %.1f cm", jarakLatar, batasJarak);
+  if (ambang > 4095) catat("PERINGATAN", "Ambang piezo > 4095, piezo tidak akan pernah aktif (cek wiring)");
+  if (batasJarak < 10) catat("PERINGATAN", "Ada benda terlalu dekat dengan ultrasonik saat kalibrasi");
+
+  // Ringkasan satu baris (retained), selalu bisa dilihat walau monitor dibuka belakangan
+  kirimTopik("kalibrasi", true,
+             "PIEZO: diam %.0f, noise %.1f, lonjakan maks %d -> ambang %.0f | "
+             "ULTRA: latar %.1f cm -> terdeteksi jika < %.1f cm",
+             piezoBaseline, piezoNoise, maks, ambang, jarakLatar, batasJarak);
 }
 
-// Tulis ke Serial (kalau USB tersambung) DAN kirim ke MQTT
-void kirimLog(const char* sub, bool retain, const char* format, ...) {
+// Kirim pesan apa adanya ke topik penyeberangan/node/<id>/<sub> (tanpa ke Serial)
+void kirimTopik(const char* sub, bool retain, const char* format, ...) {
   PesanLog lg = {};
   strlcpy(lg.sub, sub, sizeof(lg.sub));
   lg.retain = retain;
@@ -1031,9 +1046,41 @@ void kirimLog(const char* sub, bool retain, const char* format, ...) {
   va_start(args, format);
   vsnprintf(lg.isi, sizeof(lg.isi), format, args);
   va_end(args);
-
-  Serial.printf("[%s] %s\n", sub, lg.isi);
   xQueueSend(qLog, &lg, 0); // antrian penuh -> dibuang
+}
+
+// Satu baris log rapi: "[A 00:01:23] KATEGORI  | pesan"
+// Ke Serial, dan (jika keMqtt) ke topik penyeberangan/node/<id>/log
+void tulisLog(bool keMqtt, const char* tag, const char* format, va_list args) {
+  char isi[150];
+  vsnprintf(isi, sizeof(isi), format, args);
+
+  unsigned long d = millis() / 1000;
+  PesanLog lg = {};
+  snprintf(lg.isi, sizeof(lg.isi), "[%s %02lu:%02lu:%02lu] %-10s| %s",
+           idNode, d / 3600, (d / 60) % 60, d % 60, tag, isi);
+  Serial.println(lg.isi);
+
+  if (keMqtt && qLog != NULL) {
+    strlcpy(lg.sub, "log", sizeof(lg.sub));
+    lg.retain = false;
+    xQueueSend(qLog, &lg, 0); // antrian penuh -> dibuang
+  }
+}
+
+void catat(const char* tag, const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  tulisLog(true, tag, format, args);
+  va_end(args);
+}
+
+// Untuk log yang sering / kurang penting: hanya ke Serial
+void catatSerial(const char* tag, const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  tulisLog(false, tag, format, args);
+  va_end(args);
 }
 
 // Data sensor berkala untuk grafik di MQTT Explorer (hanya yang terbaru yang disimpan)
@@ -1070,8 +1117,10 @@ bool pejalanKakiTerdeteksi(unsigned long sekarang) {
   sebelumnya = deteksi;
 
   if (tepiNaik && fase == FASE_IDLE) {
-    kirimLog("sensor", true, "LOLOS: piezo %d (ambang %.0f), jarak %.1f cm (batas %.1f cm)",
-             piezoKetukan, piezoBaseline + ambangPiezo(), jarakCm, batasJarak);
+    catat("SENSOR", "Lolos: piezo %d (ambang %.0f), jarak %.1f cm (batas %.1f cm)",
+         piezoKetukan, piezoBaseline + ambangPiezo(), jarakCm, batasJarak);
+    kirimTopik("sensor", true, "LOLOS: piezo %d (ambang %.0f), jarak %.1f cm (batas %.1f cm)",
+               piezoKetukan, piezoBaseline + ambangPiezo(), jarakCm, batasJarak);
   }
   return tepiNaik;
 }
@@ -1081,15 +1130,15 @@ void tesRelay() {
   const int pinRelay[]    = { LAMPU_MERAH, LAMPU_KUNING, LAMPU_HIJAU, PIN_PJU };
   const char* namaRelay[] = { "MERAH",     "KUNING",     "HIJAU",     "PJU"   };
 
-  Serial.println("=== TES RELAY (tiap relay ON 1 detik) ===");
+  catat("RELAY", "Tes relay: tiap relay ON 1 detik bergantian");
   for (int i = 0; i < 4; i++) {
-    Serial.printf("TES RELAY: %-6s (GPIO%d) ON\n", namaRelay[i], pinRelay[i]);
+    catatSerial("RELAY", "%-6s (GPIO%d) ON", namaRelay[i], pinRelay[i]);
     digitalWrite(pinRelay[i], RELAY_ON);
     delay(1000);
     digitalWrite(pinRelay[i], RELAY_OFF);
     delay(300);
   }
-  Serial.println("=== TES RELAY SELESAI ===");
+  catat("RELAY", "Tes relay selesai");
 }
 
 void tampilkanAngka(int angka) {
