@@ -45,16 +45,20 @@
 #endif
 
 // ================= KONFIGURASI WIFI & MQTT ================= //
-const char* WIFI_SSID = "veroo";            // GANTI DENGAN WIFI HP/ROUTER
-const char* WIFI_PASS = "veronica";         // GANTI DENGAN PASS WIFI
-const char* MQTT_HOST = "10.130.117.191";   // IP laptop (Mosquitto)
+// Hotspot laptop (Windows Mobile hotspot, 2.4 GHz). IP laptop di hotspot selalu 192.168.137.1.
+const char* WIFI_SSID = "cameliaa";
+const char* WIFI_PASS = "cameliaa";
+const char* MQTT_HOST = "192.168.137.1";    // IP laptop (Mosquitto)
 const uint16_t MQTT_PORT = 1883;
 
 // Topik:
-//   penyeberangan/sync               -> pesan sinkron antar node (dan nanti CV)
+//   penyeberangan/sync               -> pesan sinkron antar node
 //   penyeberangan/node/<id>/status   -> status terakhir node (retained, untuk monitor)
 //   penyeberangan/node/<id>/online   -> "online"/"offline" (LWT, retained)
+//   jalan/status                     -> hasil CV dari laptop (testvid_fixed.py):
+//                                       {"kepadatan":2,"status":"AMAN"|"NGEBUT","timer":20}
 const char* TOPIC_SYNC = "penyeberangan/sync";
+const char* TOPIC_CV   = "jalan/status";
 
 struct PesanSync;
 void tampilkanAngka(int angka);
@@ -69,8 +73,11 @@ void kirimTopik(const char* sub, bool retain, const char* format, ...);
 void catat(const char* tag, const char* format, ...);
 void catatSerial(const char* tag, const char* format, ...);
 void mulaiSiklusLokal(unsigned long sekarang, const char* pemicu);
-void aturSiklus(uint32_t id, const char* pemilik, bool pju, uint32_t posisi, unsigned long sekarang);
+void aturSiklus(uint32_t id, const char* pemilik, bool pju, int dur, uint32_t posisi, unsigned long sekarang);
 void updateSiklus(unsigned long sekarang);
+bool cvSegar();
+int durasiDariCV();
+void tahanJikaNgebut(unsigned long sekarang);
 void prosesPesanPeer(const PesanSync& p);
 void kirimState(const char* evt, unsigned long sekarang);
 void updateLampu(unsigned long sekarang);
@@ -119,7 +126,11 @@ const int DEC2_D = 33;
 const int RELAY_ON  = HIGH;
 const int RELAY_OFF = LOW;
 
-const int DURASI_TIMER = 15;                    // Hitung mundur 15 -> 0 (detik)
+// Panjang countdown ditentukan CV (jalan/status "timer"). Nilai ini dipakai jika data CV
+// tidak ada / kedaluwarsa / di luar rentang, jadi sistem tetap jalan tanpa laptop.
+const int DURASI_TIMER_DEFAULT = 15;            // Hitung mundur 15 -> 0 (detik)
+const int DURASI_TIMER_MIN = 5;                 // rentang timer CV yang diterima (7-segment 2 digit)
+const int DURASI_TIMER_MAX = 99;
 const unsigned long DURASI_HIJAU_MS = 7000;     // Hijau nyala 7 detik setelah countdown
 const unsigned long KEDIP_KUNING_MS = 500;      // Kuning ON 0,5 s / OFF 0,5 s
 const unsigned long DEBOUNCE_MS = 50;           // Debounce tombol
@@ -165,13 +176,23 @@ const unsigned long DURASI_PREPARING_MS = 6000;
 // Buzzer panjang berhenti sebentar sebelum countdown, agar beep countdown terdengar terpisah
 const unsigned long BUZZER_JEDA_PREP_MS = 1000;
 
-// Posisi siklus (ms sejak trigger):
+// Posisi siklus (ms sejak trigger), dengan N = durasi countdown siklus ini:
 //   0 .. MS_PREP          -> PREPARING
-//   MS_PREP .. MS_TIMER   -> TIMER (angka 15..0 masing-masing 1 detik = 16 detik)
-//   MS_TIMER .. MS_SIKLUS -> HIJAU
-const unsigned long MS_PREP   = DURASI_PREPARING_MS;
-const unsigned long MS_TIMER  = MS_PREP + (DURASI_TIMER + 1) * 1000UL;
-const unsigned long MS_SIKLUS = MS_TIMER + DURASI_HIJAU_MS;
+//   MS_PREP .. msTimer(N) -> TIMER (angka N..0 masing-masing 1 detik = N+1 detik)
+//   msTimer(N) .. msSiklus(N) -> HIJAU
+// N dipilih node pemilik saat trigger dan dikirim ke node lain bersama pesan sinkron.
+const unsigned long MS_PREP = DURASI_PREPARING_MS;
+unsigned long msTimer(int n)  { return MS_PREP + (n + 1) * 1000UL; }
+unsigned long msSiklus(int n) { return msTimer(n) + DURASI_HIJAU_MS; }
+
+// Data CV (jalan/status) dari laptop. Status NGEBUT -> PREPARING ditahan (buzzer panjang
+// & kuning kedip terus) sampai AMAN, maksimal TAHAN_MAKS_MS, lalu siklus lanjut.
+// Cara menahan: node pemilik siklus menjaga posisi siklus di POS_TAHAN_MS (masih di
+// dalam bagian buzzer panjang, jauh dari akhir PREPARING), jadi node lain yang ikut
+// koreksi drift tetap sinkron.
+const unsigned long CV_KEDALUWARSA_MS = 5000;   // tidak ada data CV selama ini -> pakai default
+const unsigned long POS_TAHAN_MS      = 3500;   // posisi siklus saat ditahan
+const unsigned long TAHAN_MAKS_MS     = 15000;  // batas penahanan
 
 // Sinkronisasi
 const unsigned long HEARTBEAT_AKTIF_MS = 500;   // kirim STATE tiap 0,5 s saat siklus jalan
@@ -208,12 +229,13 @@ struct PesanSync {
   uint32_t posisiMs;   // ms sejak siklus dimulai
   uint8_t  fase;       // FaseSistem pengirim
   bool     pju;        // keputusan PJU dari pemilik siklus
+  uint8_t  dur;        // durasi countdown siklus ini (detik), dari CV oleh pemilik siklus
   uint32_t stempel;    // millis() lokal saat posisiMs dicatat (kompensasi antrian)
   uint8_t  jalur;      // JalurPesan: lewat mana pesan ini diterima
 };
 
 const uint8_t ALAMAT_BROADCAST[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-const uint32_t MAGIC_PAKET = 0x50594231; // "PYB1", menyaring paket ESP-NOW lain
+const uint32_t MAGIC_PAKET = 0x50594232; // "PYB2", menyaring paket ESP-NOW lain (PYB1 = firmware lama tanpa dur)
 
 // Format paket ESP-NOW (biner, ukuran tetap)
 struct __attribute__((packed)) PaketNow {
@@ -224,6 +246,7 @@ struct __attribute__((packed)) PaketNow {
   uint32_t posisiMs;
   uint8_t  fase;
   uint8_t  pju;
+  uint8_t  dur;
 };
 
 QueueHandle_t qKirim  = NULL;  // loop() -> taskJaringan (khusus MQTT)
@@ -263,7 +286,15 @@ uint32_t idSiklusSelesai = 0;          // siklus terakhir yang sudah selesai
 char pemilikSiklus[16] = "";
 unsigned long waktuMulaiSiklus = 0;
 bool statusPJU = false;
+int durTimer = DURASI_TIMER_DEFAULT;   // durasi countdown siklus yang sedang berjalan (detik)
+unsigned long waktuTahanMulai = 0;     // kapan PREPARING mulai ditahan (0 = belum ditahan)
+bool tahanSelesai = false;             // penahanan sudah dilepas / tidak diperlukan di siklus ini
 int angkaTampil = -1;                  // angka yang sedang tampil di 7-segment
+
+// Hasil CV terakhir (ditulis taskJaringan di core 0, dibaca loop() di core 1)
+volatile int cvTimer = 0;                   // detik, 0 = belum pernah menerima
+volatile bool cvNgebut = false;
+volatile unsigned long cvWaktuTerima = 0;   // millis() saat jalan/status terakhir diterima
 unsigned long waktuHeartbeat = 0;
 
 // Variabel untuk kedip kuning tanpa delay
@@ -414,19 +445,70 @@ void mulaiSiklusLokal(unsigned long sekarang, const char* pemicu) {
        gelap ? "GELAP" : "TERANG", bacaanLDR == HIGH ? "HIGH" : "LOW",
        gelap ? "ON" : "OFF");
 
-  aturSiklus(esp_random() | 1, idNode, gelap, 0, sekarang); // |1 agar id tidak pernah 0
+  // Durasi countdown dari CV, dikunci selama siklus & dibagikan ke node lain
+  int dur = durasiDariCV();
+  if (cvSegar()) catat("CV", "timer %d s, status %s", dur, cvNgebut ? "NGEBUT" : "AMAN");
+  else catat("CV", "tidak ada data CV -> pakai default %d s", dur);
+
+  aturSiklus(esp_random() | 1, idNode, gelap, dur, 0, sekarang); // |1 agar id tidak pernah 0
   kirimState("START", sekarang);
 }
 
+// Data CV dianggap segar jika diterima < CV_KEDALUWARSA_MS lalu
+bool cvSegar() {
+  unsigned long t = cvWaktuTerima;
+  return t != 0 && millis() - t < CV_KEDALUWARSA_MS;
+}
+
+// Countdown dari CV bila segar & valid, selain itu default
+int durasiDariCV() {
+  int t = cvTimer;
+  if (cvSegar() && t >= DURASI_TIMER_MIN && t <= DURASI_TIMER_MAX) return t;
+  return DURASI_TIMER_DEFAULT;
+}
+
 // Pasang siklus (milik sendiri atau ikut node lain) pada posisi tertentu
-void aturSiklus(uint32_t id, const char* pemilik, bool pju, uint32_t posisi, unsigned long sekarang) {
+void aturSiklus(uint32_t id, const char* pemilik, bool pju, int dur, uint32_t posisi, unsigned long sekarang) {
   idSiklus = id;
   strlcpy(pemilikSiklus, pemilik, sizeof(pemilikSiklus));
   statusPJU = pju;
+  durTimer = (dur >= 1 && dur <= 99) ? dur : DURASI_TIMER_DEFAULT; // pesan tanpa/salah dur -> default
+  waktuTahanMulai = 0;
+  tahanSelesai = false;
   waktuMulaiSiklus = sekarang - posisi;
   angkaTampil = -1; // paksa 7-segment ditulis ulang
   updateSiklus(sekarang);
   terapkanPJU(); // keputusan PJU bisa berubah (konflik siklus) walau fase sama
+}
+
+// Hanya node pemilik siklus yang menahan. Selama CV melaporkan NGEBUT, posisi siklus dijaga
+// di POS_TAHAN_MS (PREPARING, buzzer panjang tetap bunyi). Dilepas saat AMAN, data CV
+// kedaluwarsa, atau sudah TAHAN_MAKS_MS; setelah itu siklus berjalan normal.
+void tahanJikaNgebut(unsigned long sekarang) {
+  if (tahanSelesai || fase != FASE_PREP || strcmp(pemilikSiklus, idNode) != 0) return;
+
+  unsigned long posisi = sekarang - waktuMulaiSiklus;
+  if (posisi < POS_TAHAN_MS) return;
+
+  bool sedangTahan = (waktuTahanMulai != 0);
+  // Lewat bagian buzzer panjang tanpa pernah ditahan -> tidak ada penahanan di siklus ini
+  if (!sedangTahan && posisi >= MS_PREP - BUZZER_JEDA_PREP_MS) {
+    tahanSelesai = true;
+    return;
+  }
+
+  bool perlu = cvSegar() && cvNgebut;
+  if (perlu && (!sedangTahan || sekarang - waktuTahanMulai < TAHAN_MAKS_MS)) {
+    if (!sedangTahan) {
+      waktuTahanMulai = sekarang;
+      catat("TAHAN", "Kendaraan NGEBUT -> PREPARING ditahan (maks %lu s)", TAHAN_MAKS_MS / 1000);
+    }
+    waktuMulaiSiklus = sekarang - POS_TAHAN_MS;
+  } else if (sedangTahan) {
+    tahanSelesai = true;
+    catat("TAHAN", "Dilepas setelah %.1f s (%s)", (sekarang - waktuTahanMulai) / 1000.0f,
+         perlu ? "batas waktu tercapai" : "jalan aman / data CV hilang");
+  }
 }
 
 // PJU baru dinyalakan saat penyeberangan benar-benar dimulai (TIMER & HIJAU),
@@ -450,7 +532,7 @@ void gantiFase(FaseSistem baru, unsigned long sekarang) {
     case FASE_TIMER:
       digitalWrite(PIN_PILOT, HIGH);
       terapkanPJU();
-      catat("FASE", "MERAH     : countdown %d s, PJU %s", DURASI_TIMER, statusPJU ? "ON" : "OFF");
+      catat("FASE", "MERAH     : countdown %d s, PJU %s", durTimer, statusPJU ? "ON" : "OFF");
       break;
 
     case FASE_HIJAU:
@@ -481,15 +563,17 @@ void gantiFase(FaseSistem baru, unsigned long sekarang) {
 void updateSiklus(unsigned long sekarang) {
   if (idSiklus == 0) return;
 
+  tahanJikaNgebut(sekarang);
+
   unsigned long posisi = sekarang - waktuMulaiSiklus;
-  FaseSistem target = (posisi < MS_PREP)   ? FASE_PREP
-                    : (posisi < MS_TIMER)  ? FASE_TIMER
-                    : (posisi < MS_SIKLUS) ? FASE_HIJAU
+  FaseSistem target = (posisi < MS_PREP)            ? FASE_PREP
+                    : (posisi < msTimer(durTimer))  ? FASE_TIMER
+                    : (posisi < msSiklus(durTimer)) ? FASE_HIJAU
                     : FASE_IDLE;
   if (target != fase) gantiFase(target, sekarang);
 
   if (fase == FASE_TIMER) {
-    int angka = DURASI_TIMER - (int)((posisi - MS_PREP) / 1000);
+    int angka = durTimer - (int)((posisi - MS_PREP) / 1000);
     if (angka != angkaTampil) {
       angkaTampil = angka;
       tampilkanAngka(angka);
@@ -504,17 +588,18 @@ void prosesPesanPeer(const PesanSync& p) {
 
   unsigned long sekarang = millis();
   uint32_t posisi = p.posisiMs + (sekarang - p.stempel);
-  if (posisi >= MS_SIKLUS) return; // siklus node lain sudah selesai
+  int durPeer = (p.dur >= 1 && p.dur <= 99) ? p.dur : DURASI_TIMER_DEFAULT;
+  if (posisi >= msSiklus(durPeer)) return; // siklus node lain sudah selesai
 
   if (idSiklus == 0) {
     // Heartbeat telat dari siklus yang baru saja kita selesaikan -> abaikan
     if (p.idSiklus == idSiklusSelesai) return;
 
     catat("SIKLUS", "------------------- SIKLUS BARU -------------------");
-    catat("SYNC", "Ikut siklus %08lX dari node %s via %s (%s, posisi %lu ms)",
+    catat("SYNC", "Ikut siklus %08lX dari node %s via %s (%s, posisi %lu ms, countdown %d s)",
          (unsigned long)p.idSiklus, p.asal, NAMA_JALUR[p.jalur], p.evt,
-         (unsigned long)posisi);
-    aturSiklus(p.idSiklus, p.asal, p.pju, posisi, sekarang);
+         (unsigned long)posisi, durPeer);
+    aturSiklus(p.idSiklus, p.asal, p.pju, durPeer, posisi, sekarang);
 
   } else if (p.idSiklus == idSiklus) {
     // Siklus sama: hanya pemilik siklus yang jadi acuan koreksi drift
@@ -533,7 +618,7 @@ void prosesPesanPeer(const PesanSync& p) {
     // Tombol ditekan hampir bersamaan di kedua sisi: id terkecil menang
     catat("SYNC", "Konflik siklus, ikut %08lX dari node %s via %s",
          (unsigned long)p.idSiklus, p.asal, NAMA_JALUR[p.jalur]);
-    aturSiklus(p.idSiklus, p.asal, p.pju, posisi, sekarang);
+    aturSiklus(p.idSiklus, p.asal, p.pju, durPeer, posisi, sekarang);
   }
   // p.idSiklus > idSiklus: node lain yang akan mengikuti siklus kita
 }
@@ -549,6 +634,7 @@ void kirimState(const char* evt, unsigned long sekarang) {
   p.posisiMs = idSiklus ? (sekarang - waktuMulaiSiklus) : 0;
   p.fase = fase;
   p.pju = statusPJU;
+  p.dur = durTimer;
   p.stempel = sekarang;
 
   if (espNowSiap) {
@@ -560,6 +646,7 @@ void kirimState(const char* evt, unsigned long sekarang) {
     pk.posisiMs = p.posisiMs;
     pk.fase = p.fase;
     pk.pju = p.pju;
+    pk.dur = p.dur;
     esp_now_send(ALAMAT_BROADCAST, (const uint8_t*)&pk, sizeof(pk));
   }
 
@@ -593,6 +680,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   StaticJsonDocument<256> doc;
   if (deserializeJson(doc, payload, length)) return;
 
+  // Hasil CV dari laptop: hanya disimpan, loop() yang memakainya saat trigger
+  if (strcmp(topic, TOPIC_CV) == 0) {
+    cvTimer = doc["timer"] | 0;   // "HOLD"/non-angka dari CV versi lama -> 0 -> default
+    cvNgebut = strcmp(doc["status"] | "", "NGEBUT") == 0;
+    cvWaktuTerima = millis();
+    return;
+  }
+
   const char* asal = doc["src"] | "";
   if (asal[0] == '\0' || strcmp(asal, idNode) == 0) return; // pesan sendiri
 
@@ -602,6 +697,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   p.idSiklus = doc["cyc"] | 0UL;
   p.posisiMs = doc["pos"] | 0UL;
   p.pju = doc["pju"] | false;
+  p.dur = doc["dur"] | 0;
   p.stempel = millis();
   p.jalur = JALUR_MQTT;
   xQueueSend(qTerima, &p, 0);
@@ -628,6 +724,7 @@ void espNowTerima(const uint8_t* mac, const uint8_t* data, int len) {
   p.posisiMs = pk.posisiMs;
   p.fase = pk.fase;
   p.pju = pk.pju;
+  p.dur = pk.dur;
   p.stempel = millis();
   p.jalur = JALUR_ESPNOW;
 
@@ -667,7 +764,8 @@ void publishMqtt(const PesanSync& p) {
   doc["pos"]  = posisi;
   doc["fase"] = NAMA_FASE[p.fase];
   doc["pju"]  = p.pju;
-  if (p.fase == FASE_TIMER) doc["sisa"] = DURASI_TIMER - (int)((posisi - MS_PREP) / 1000);
+  doc["dur"]  = p.dur;
+  if (p.fase == FASE_TIMER) doc["sisa"] = p.dur - (int)((posisi - MS_PREP) / 1000);
 
   char buf[200];
   size_t n = serializeJson(doc, buf, sizeof(buf));
@@ -680,6 +778,7 @@ void hubungkanMQTT() {
     catat("MQTT", "Terhubung ke broker %s:%u", MQTT_HOST, MQTT_PORT);
     mqtt.publish(topicOnline, "online", true);
     mqtt.subscribe(TOPIC_SYNC);
+    mqtt.subscribe(TOPIC_CV);
   } else {
     catatSerial("MQTT", "Gagal terhubung ke broker %s:%u (rc=%d)", MQTT_HOST, MQTT_PORT, mqtt.state());
   }
