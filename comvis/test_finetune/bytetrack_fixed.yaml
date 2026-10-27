@@ -1,0 +1,12 @@
+tracker_type: bytetrack
+track_high_thresh: 0.25  # Deteksi >= ini ikut asosiasi tahap 1 (dan boleh jadi track baru)
+track_low_thresh: 0.10   # Deteksi 0.10 - 0.25 dipakai tahap 2 untuk MELANJUTKAN track yang sudah ada
+new_track_thresh: 0.25   # Minimal conf untuk membuat track baru
+track_buffer: 60         # Track yang hilang diingat 60 frame tracker (~2 detik @30fps)
+match_thresh: 0.8        # cost = 1 - IoU  -> cukup IoU >= 0.2 untuk dianggap objek yang sama
+
+# WAJIB False. Kalau True, cost = 1 - (IoU x conf), akibatnya di Ultralytics 8.4.x:
+#  - tahap 2 (conf < 0.25) butuh IoU x conf >= 0.5  -> MUSTAHIL, deteksi lemah selalu dibuang
+#  - track baru baru tampil kalau frame berikutnya IoU x conf >= 0.3 -> kendaraan conf 0.30
+#    butuh IoU 1.0 (tidak mungkin saat bergerak) -> tidak pernah dapat bounding box
+fuse_score: False
